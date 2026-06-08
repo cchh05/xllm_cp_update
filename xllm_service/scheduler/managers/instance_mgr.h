@@ -49,7 +49,7 @@ class InstanceMgr final {
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
-  bool get_next_instance_pair(Routing* routing);
+  bool get_next_instance_pair(const std::shared_ptr<Request>& request);
 
   std::vector<std::string> get_static_decode_list(
       const std::string& instance_name);
@@ -65,6 +65,8 @@ class InstanceMgr final {
       const std::shared_ptr<Request>& request);
   bool record_instance_heartbeat(const std::string& instance_name,
                                  const std::string& incarnation_id);
+  bool recover_instance_from_etcd(const std::string& instance_name,
+                                  const std::string& incarnation_id);
   void record_load_metrics_update(const std::string& instance_name,
                                   const proto::LoadMetrics& load_metrics);
   bool upload_load_metrics();
@@ -79,6 +81,11 @@ class InstanceMgr final {
 
   // select instances based on the SLO
   bool select_instance_pair_on_slo(std::shared_ptr<Request> request);
+
+  // Service-side decode backpressure. A prefill score-only term would be
+  // identical for all candidates when the topology has one decode lane.
+  bool wait_for_decode_pressure_admission(
+      const std::shared_ptr<Request>& request);
 
   void set_as_master();
 
@@ -181,6 +188,8 @@ class InstanceMgr final {
   std::vector<std::string> decode_index_;
   uint64_t next_prefill_index_ = 0;
   uint64_t next_decode_index_ = 0;
+  uint64_t next_static_short_prefill_tie_break_index_ = 0;
+  uint64_t next_static_long_prefill_tie_break_index_ = 0;
   std::unordered_map<std::string, std::shared_ptr<brpc::Channel>>
       cached_channels_;
 

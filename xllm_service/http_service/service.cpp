@@ -52,6 +52,23 @@ std::string generate_service_request_id(const std::string& method) {
   return ss.str();
 }
 
+std::string extract_client_request_id(brpc::Controller* cntl) {
+  if (cntl == nullptr) {
+    return "";
+  }
+  if (cntl->http_request().GetHeader("x-request-id")) {
+    return *cntl->http_request().GetHeader("x-request-id");
+  }
+  if (cntl->http_request().GetHeader("x-ms-client-request-id")) {
+    return *cntl->http_request().GetHeader("x-ms-client-request-id");
+  }
+  return "";
+}
+
+int64_t current_time_ms_for_stage_trace() {
+  return absl::ToUnixMillis(absl::Now());
+}
+
 nlohmann::json proto_value_to_json(const google::protobuf::Value& pb_value);
 
 nlohmann::json proto_struct_to_json(const google::protobuf::Struct& pb_struct) {
@@ -237,6 +254,8 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
   // async redistribute the request and wait the response
   // TODO: optimize the thread pool to async mode.
   auto& target_uri = request->routing.prefill_name;
+  request->stage_timing_trace.prefill_dispatch_ts_ms =
+      current_time_ms_for_stage_trace();
   brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
   // use stub
   xllm::proto::XllmAPIService_Stub stub(channel_ptr);
@@ -266,13 +285,16 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
 template <typename T>
 std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
     T* req_pb,
-    const std::string& method) {
+    const std::string& method,
+    brpc::Controller* cntl) {
   auto request = std::make_shared<Request>();
   request->model = req_pb->model();
 
   // TODO: add `created_time` fileds etc.
   // create xllm_service request_id: service_request_id
   request->service_request_id = generate_service_request_id(method);
+  request->client_request_id = extract_client_request_id(cntl);
+  request->stage_timing_trace.ingress_ts_ms = current_time_ms_for_stage_trace();
 
   if (req_pb->has_stream()) {
     request->stream = req_pb->stream();
@@ -280,6 +302,10 @@ std::shared_ptr<Request> XllmHttpServiceImpl::generate_request(
 
   if (req_pb->has_stream_options()) {
     request->include_usage = req_pb->stream_options().include_usage();
+  }
+
+  if (req_pb->has_max_tokens()) {
+    request->max_tokens = static_cast<int64_t>(req_pb->max_tokens());
   }
 
   if (options_.enable_request_trace()) {
@@ -392,7 +418,7 @@ void XllmHttpServiceImpl::Completions(
     return;
   }
 
-  auto service_request = generate_request(req_pb, "/v1/completions");
+  auto service_request = generate_request(req_pb, "/v1/completions", cntl);
 
   if (!req_pb->prompt().empty()) {
     service_request->prompt = req_pb->prompt();
@@ -466,7 +492,7 @@ void XllmHttpServiceImpl::ChatCompletions(
     return;
   }
 
-  auto service_request = generate_request(req_pb, "/v1/chat/completions");
+  auto service_request = generate_request(req_pb, "/v1/chat/completions", cntl);
 
   if (req_pb->messages_size() > 0) {
     service_request->messages.reserve(req_pb->messages_size());

@@ -165,6 +165,33 @@ void XllmRpcService::Generations(google::protobuf::RpcController* cntl_base,
     request_output.finished_on_prefill_instance =
         request.finished_on_prefill_instance();
     request_output.finished = request.finished();
+    request_output.worker_request_ingress_ts_ms =
+        request.worker_request_ingress_ts_ms();
+    request_output.worker_first_token_ts_ms =
+        request.worker_first_token_ts_ms();
+    request_output.worker_output_emit_ts_ms =
+        request.worker_output_emit_ts_ms();
+    request_output.warmup_decision.warmup_triggered =
+        request.warmup_triggered();
+    request_output.warmup_decision.warmup_state = request.warmup_state();
+    request_output.warmup_decision.warmup_reason = request.warmup_reason();
+    request_output.warmup_decision.worker_idle_ms =
+        request.worker_idle_ms();
+    request_output.warmup_decision.pending_requests =
+        request.pending_requests();
+    request_output.warmup_decision.running_requests =
+        request.running_requests();
+    request_output.warmup_decision.skip_reason = request.skip_reason();
+    LOG(INFO) << "StageTraceRecv service_request_id="
+              << request_output.service_request_id
+              << " worker_request_ingress_ts_ms="
+              << request_output.worker_request_ingress_ts_ms
+              << " worker_first_token_ts_ms="
+              << request_output.worker_first_token_ts_ms
+              << " worker_output_emit_ts_ms="
+              << request_output.worker_output_emit_ts_ms
+              << " finished_on_prefill_instance="
+              << request_output.finished_on_prefill_instance;
     for (auto& output : request.outputs()) {
       llm::SequenceOutput sequence_output;
       sequence_output.index = output.index();

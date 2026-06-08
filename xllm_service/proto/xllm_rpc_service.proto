@@ -133,6 +133,16 @@ message DisaggStreamGeneration {
   OutputUsage usage = 5;
   bool finished = 6;
   bool finished_on_prefill_instance = 7;
+  int64 worker_request_ingress_ts_ms = 8;
+  int64 worker_first_token_ts_ms = 9;
+  int64 worker_output_emit_ts_ms = 10;
+  bool warmup_triggered = 11;
+  string warmup_state = 12;
+  string warmup_reason = 13;
+  int64 worker_idle_ms = 14;
+  int32 pending_requests = 15;
+  int32 running_requests = 16;
+  string skip_reason = 17;
 }
 
 message DisaggStreamGenerations {

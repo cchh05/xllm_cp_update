@@ -16,17 +16,24 @@ limitations under the License.
 #include "instance_mgr.h"
 
 #include <absl/strings/str_join.h>
+#include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <brpc/controller.h>
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -55,14 +62,208 @@ std::string ETCD_LOADMETRICS_PREFIX = "XLLM:LOADMETRICS:";
 constexpr char kHealthPath[] = "/health";
 constexpr int64_t kDeleteProbeRetryBackoffMs = 100;
 
+double clamp_unit_interval(double value) {
+  return std::max(0.0, std::min(1.0, value));
+}
+
+enum class DecodeAdmissionPressureTier : int8_t {
+  kOpen = 0,
+  kMedium = 1,
+  kHard = 2,
+};
+
+const char* decode_admission_pressure_tier_name(
+    DecodeAdmissionPressureTier tier) {
+  switch (tier) {
+    case DecodeAdmissionPressureTier::kOpen:
+      return "open";
+    case DecodeAdmissionPressureTier::kMedium:
+      return "medium";
+    case DecodeAdmissionPressureTier::kHard:
+      return "hard";
+  }
+  return "unknown";
+}
+
+struct DecodeAdmissionCandidateState {
+  std::string instance_name;
+  int64_t active_requests = 0;
+  int64_t waiting_requests = 0;
+  int64_t estimated_tpot_ms = -1;
+  bool has_tpot_signal = false;
+  DecodeAdmissionPressureTier pressure_tier =
+      DecodeAdmissionPressureTier::kOpen;
+};
+
 uint64_t current_time_ms() {
   return static_cast<uint64_t>(
       absl::ToInt64Milliseconds(absl::Now() - absl::UnixEpoch()));
 }
 
+int64_t estimate_decode_work_tokens(const std::shared_ptr<xllm_service::Request>& request,
+                                    int64_t prompt_tokens,
+                                    bool request_is_long) {
+  if (!FLAGS_decode_pressure_admission_use_output_work) {
+    return prompt_tokens;
+  }
+  if (request != nullptr && request->max_tokens > 0) {
+    return request->max_tokens;
+  }
+  const int64_t default_output_tokens =
+      request_is_long ? FLAGS_decode_pressure_admission_default_long_output_tokens
+                      : FLAGS_decode_pressure_admission_default_short_output_tokens;
+  return default_output_tokens > 0 ? default_output_tokens : prompt_tokens;
+}
+
+DecodeAdmissionPressureTier evaluate_decode_admission_pressure_tier(
+    const DecodeAdmissionCandidateState& candidate,
+    bool request_is_long,
+    int64_t base_active_cap,
+    int64_t effective_target_tpot_ms) {
+  const int64_t hard_active_cap =
+      std::max<int64_t>(0,
+                        base_active_cap +
+                            FLAGS_decode_pressure_admission_hard_active_burst);
+  const int64_t short_active_cap =
+      std::max<int64_t>(0,
+                        base_active_cap +
+                            FLAGS_decode_pressure_admission_short_active_burst);
+  const bool hard_waiting =
+      FLAGS_decode_pressure_admission_hard_waiting_requests > 0 &&
+      candidate.waiting_requests >=
+          FLAGS_decode_pressure_admission_hard_waiting_requests;
+  const bool hard_active =
+      base_active_cap > 0 && candidate.active_requests >= hard_active_cap;
+  bool hard_tpot = false;
+  bool medium_tpot = false;
+  if (candidate.has_tpot_signal && effective_target_tpot_ms > 0) {
+    const double estimated_tpot_ms =
+        static_cast<double>(candidate.estimated_tpot_ms);
+    hard_tpot = estimated_tpot_ms >=
+                static_cast<double>(effective_target_tpot_ms) *
+                    FLAGS_decode_pressure_admission_hard_tpot_ratio;
+    medium_tpot =
+        estimated_tpot_ms >=
+        static_cast<double>(effective_target_tpot_ms) *
+            FLAGS_decode_pressure_admission_soft_tpot_ratio;
+  }
+  if (hard_waiting || hard_active || hard_tpot) {
+    return DecodeAdmissionPressureTier::kHard;
+  }
+
+  const bool medium_waiting =
+      FLAGS_decode_pressure_admission_medium_waiting_requests > 0 &&
+      candidate.waiting_requests >=
+          FLAGS_decode_pressure_admission_medium_waiting_requests;
+  const bool medium_active =
+      base_active_cap > 0 &&
+      (request_is_long ? candidate.active_requests >= base_active_cap
+                       : candidate.active_requests >= short_active_cap);
+  if (medium_waiting || medium_active || medium_tpot) {
+    return DecodeAdmissionPressureTier::kMedium;
+  }
+  return DecodeAdmissionPressureTier::kOpen;
+}
+
+double lane_normalized_projected_prefill_time_penalty(
+    int64_t projected_prefill_time_ms,
+    bool is_long_affine,
+    bool is_short_affine) {
+  if (!FLAGS_enable_lane_normalized_projected_prefill_time_route_signal ||
+      FLAGS_hybrid_prefill_projected_prefill_time_normalized_weight <= 0.0 ||
+      projected_prefill_time_ms <= 0) {
+    return 0.0;
+  }
+  double baseline_ms = 1.0;
+  if (is_long_affine) {
+    baseline_ms =
+        FLAGS_hybrid_prefill_long_lane_projected_prefill_time_baseline_ms;
+  } else if (is_short_affine) {
+    baseline_ms =
+        FLAGS_hybrid_prefill_short_pool_projected_prefill_time_baseline_ms;
+  }
+  if (baseline_ms <= 0.0) {
+    return 0.0;
+  }
+  double normalized_time =
+      static_cast<double>(projected_prefill_time_ms) / baseline_ms;
+  if (FLAGS_hybrid_prefill_projected_prefill_time_normalized_cap > 0.0) {
+    normalized_time =
+        std::min(normalized_time,
+                 FLAGS_hybrid_prefill_projected_prefill_time_normalized_cap);
+  }
+  return normalized_time *
+         FLAGS_hybrid_prefill_projected_prefill_time_normalized_weight;
+}
+
+std::string get_client_request_id(const std::shared_ptr<xllm_service::Request>& request) {
+  if (request == nullptr) {
+    return "";
+  }
+  if (!request->client_request_id.empty()) {
+    return request->client_request_id;
+  }
+  if (request->call_data == nullptr) {
+    return "";
+  }
+  return request->call_data->x_request_id;
+}
+
+bool should_sample_route_trace(const bool request_is_long,
+                               uint64_t* sample_ordinal) {
+  if (sample_ordinal != nullptr) {
+    *sample_ordinal = 0;
+  }
+  if (!FLAGS_enable_route_trace) {
+    return false;
+  }
+  if (FLAGS_route_trace_long_requests_only && !request_is_long) {
+    return false;
+  }
+
+  static std::atomic<uint64_t> route_trace_request_counter{0};
+  const int32_t sample_every_n = std::max(1, FLAGS_route_trace_sample_every_n);
+  const uint64_t ordinal =
+      route_trace_request_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (((ordinal - 1) % static_cast<uint64_t>(sample_every_n)) != 0) {
+    return false;
+  }
+
+  if (sample_ordinal != nullptr) {
+    *sample_ordinal = ordinal;
+  }
+  return true;
+}
+
+void append_route_trace_jsonl(const nlohmann::json& trace_entry) {
+  static std::mutex route_trace_mutex;
+  std::lock_guard<std::mutex> lock(route_trace_mutex);
+
+  const std::filesystem::path log_path(FLAGS_route_trace_log_path);
+  if (!log_path.parent_path().empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(log_path.parent_path(), ec);
+    if (ec) {
+      LOG(ERROR) << "Failed to create route trace directory: "
+                 << log_path.parent_path() << ", error: " << ec.message();
+      return;
+    }
+  }
+
+  std::ofstream log_stream(log_path, std::ios::app);
+  if (!log_stream.is_open()) {
+    LOG(ERROR) << "Failed to open route trace log file: " << log_path;
+    return;
+  }
+  log_stream << trace_entry.dump() << "\n";
+}
+
 bool is_instance_schedulable(const xllm_service::InstanceMetaInfo& info) {
   // LEASE_LOST instances can still be reused while heartbeats continue.
-  return info.runtime_state != InstanceRuntimeState::SUSPECT;
+  // REGISTERING instances are visible for heartbeats/recovery, but must not be
+  // selected until their registration/link phase finishes.
+  return info.runtime_state != InstanceRuntimeState::SUSPECT &&
+         info.runtime_state != InstanceRuntimeState::REGISTERING;
 }
 
 bool select_next_schedulable_instance(
@@ -102,6 +303,254 @@ size_t count_schedulable_instances(
     ++count;
   }
   return count;
+}
+
+std::vector<std::string> get_schedulable_prefill_instances(
+    const std::unordered_map<std::string, xllm_service::InstanceMetaInfo>&
+        instances,
+    const std::vector<std::string>& prefill_index,
+    bool has_unschedulable_instances) {
+  std::vector<std::string> result;
+  result.reserve(prefill_index.size());
+  for (const auto& name : prefill_index) {
+    if (!has_unschedulable_instances) {
+      result.emplace_back(name);
+      continue;
+    }
+
+    auto it = instances.find(name);
+    if (it == instances.end() || !is_instance_schedulable(it->second)) {
+      continue;
+    }
+    result.emplace_back(name);
+  }
+  return result;
+}
+
+std::vector<std::string> parse_instance_selectors(const std::string& csv) {
+  std::vector<std::string> selectors;
+  for (absl::string_view item : absl::StrSplit(csv, ',', absl::SkipWhitespace())) {
+    if (!item.empty()) {
+      selectors.emplace_back(item);
+    }
+  }
+  return selectors;
+}
+
+bool is_digits_only(const std::string& value) {
+  return !value.empty() &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return std::isdigit(ch) != 0;
+         });
+}
+
+bool instance_matches_selector(const std::string& instance_name,
+                               const std::string& selector) {
+  if (selector.empty()) {
+    return false;
+  }
+  if (instance_name == selector) {
+    return true;
+  }
+
+  std::string suffix;
+  if (selector.front() == ':') {
+    suffix = selector;
+  } else if (is_digits_only(selector)) {
+    suffix = ":" + selector;
+  } else {
+    return false;
+  }
+
+  if (instance_name.size() < suffix.size()) {
+    return false;
+  }
+  return instance_name.compare(instance_name.size() - suffix.size(),
+                               suffix.size(),
+                               suffix) == 0;
+}
+
+std::vector<std::string> filter_prefill_instances_by_selector(
+    const std::vector<std::string>& instances,
+    const std::vector<std::string>& selectors) {
+  if (selectors.empty()) {
+    return {};
+  }
+
+  std::vector<std::string> filtered;
+  filtered.reserve(instances.size());
+  for (const auto& name : instances) {
+    if (std::any_of(selectors.begin(),
+                    selectors.end(),
+                    [&](const std::string& selector) {
+                      return instance_matches_selector(name, selector);
+                    })) {
+      filtered.emplace_back(name);
+    }
+  }
+  return filtered;
+}
+
+int64_t get_prefill_request_num(
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics,
+    const std::string& instance_name) {
+  const auto it = request_metrics.find(instance_name);
+  return it == request_metrics.end() ? 0 : it->second.prefill_request_num;
+}
+
+int64_t get_prefill_token_num(
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics,
+    const std::string& instance_name) {
+  const auto it = request_metrics.find(instance_name);
+  return it == request_metrics.end() ? 0 : it->second.prefill_token_num;
+}
+
+uint64_t get_waiting_requests_num(
+    const std::unordered_map<std::string, xllm_service::LoadMetrics>&
+        load_metrics,
+    const std::string& instance_name) {
+  const auto it = load_metrics.find(instance_name);
+  return it == load_metrics.end() ? 0 : it->second.waiting_requests_num;
+}
+
+uint64_t get_prefill_combined_load(
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics,
+    const std::unordered_map<std::string, xllm_service::LoadMetrics>&
+        load_metrics,
+    const std::string& instance_name) {
+  return get_waiting_requests_num(load_metrics, instance_name) +
+         static_cast<uint64_t>(
+             std::max<int64_t>(0,
+                               get_prefill_request_num(request_metrics,
+                                                       instance_name)));
+}
+
+int64_t min_prefill_request_num(
+    const std::vector<std::string>& instances,
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics) {
+  int64_t min_value = std::numeric_limits<int64_t>::max();
+  for (const auto& instance_name : instances) {
+    min_value = std::min(min_value,
+                         get_prefill_request_num(request_metrics, instance_name));
+  }
+  return min_value == std::numeric_limits<int64_t>::max() ? 0 : min_value;
+}
+
+int64_t min_prefill_token_num(
+    const std::vector<std::string>& instances,
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics) {
+  int64_t min_value = std::numeric_limits<int64_t>::max();
+  for (const auto& instance_name : instances) {
+    min_value = std::min(min_value,
+                         get_prefill_token_num(request_metrics, instance_name));
+  }
+  return min_value == std::numeric_limits<int64_t>::max() ? 0 : min_value;
+}
+
+uint64_t min_prefill_combined_load(
+    const std::vector<std::string>& instances,
+    const std::unordered_map<std::string, xllm_service::RequestMetrics>&
+        request_metrics,
+    const std::unordered_map<std::string, xllm_service::LoadMetrics>&
+        load_metrics) {
+  uint64_t min_value = std::numeric_limits<uint64_t>::max();
+  for (const auto& instance_name : instances) {
+    min_value = std::min(
+        min_value,
+        get_prefill_combined_load(request_metrics, load_metrics, instance_name));
+  }
+  return min_value == std::numeric_limits<uint64_t>::max() ? 0 : min_value;
+}
+
+bool use_hybrid_prefill_scoring_v0_3_family() {
+  return FLAGS_hybrid_prefill_scoring_version == "v0_3" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0_3a" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3a" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0_3b" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3b" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0_3c" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3c";
+}
+
+bool use_hybrid_prefill_scoring_v0_3a() {
+  return FLAGS_hybrid_prefill_scoring_version == "v0_3a" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3a";
+}
+
+bool use_hybrid_prefill_scoring_v0_3b() {
+  return FLAGS_hybrid_prefill_scoring_version == "v0_3b" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3b";
+}
+
+bool use_hybrid_prefill_scoring_v0_3c() {
+  return FLAGS_hybrid_prefill_scoring_version == "v0_3c" ||
+         FLAGS_hybrid_prefill_scoring_version == "v0.3c";
+}
+
+int32_t resolve_v0_3_soft_long_lower_tokens(const int32_t hard_long_threshold) {
+  if (FLAGS_hybrid_prefill_v0_3_soft_long_lower_tokens > 0) {
+    return FLAGS_hybrid_prefill_v0_3_soft_long_lower_tokens;
+  }
+  return std::max<int32_t>(0, hard_long_threshold);
+}
+
+int32_t resolve_v0_3_soft_long_upper_tokens(const int32_t hard_long_threshold,
+                                            const int32_t lower_tokens) {
+  if (FLAGS_hybrid_prefill_v0_3_soft_long_upper_tokens > lower_tokens) {
+    return FLAGS_hybrid_prefill_v0_3_soft_long_upper_tokens;
+  }
+
+  const int32_t fallback_upper =
+      std::max<int32_t>(hard_long_threshold * 2, lower_tokens + 1);
+  return fallback_upper;
+}
+
+double compute_v0_3_long_request_scale(const int32_t request_tokens,
+                                       const int32_t lower_tokens,
+                                       const int32_t upper_tokens) {
+  if (upper_tokens <= lower_tokens) {
+    return request_tokens > lower_tokens ? 1.0 : 0.0;
+  }
+  if (request_tokens <= lower_tokens) {
+    return 0.0;
+  }
+  if (request_tokens >= upper_tokens) {
+    return 1.0;
+  }
+  return static_cast<double>(request_tokens - lower_tokens) /
+         static_cast<double>(upper_tokens - lower_tokens);
+}
+
+std::vector<std::string> merge_unique_instance_lists(
+    const std::vector<std::string>& primary,
+    const std::vector<std::string>& secondary) {
+  std::vector<std::string> merged;
+  merged.reserve(primary.size() + secondary.size());
+  std::unordered_set<std::string> seen;
+  seen.reserve(primary.size() + secondary.size());
+  for (const auto& instance_name : primary) {
+    if (seen.insert(instance_name).second) {
+      merged.emplace_back(instance_name);
+    }
+  }
+  for (const auto& instance_name : secondary) {
+    if (seen.insert(instance_name).second) {
+      merged.emplace_back(instance_name);
+    }
+  }
+  return merged;
+}
+
+bool instance_in_list(const std::vector<std::string>& instances,
+                      const std::string& instance_name) {
+  return std::find(instances.begin(), instances.end(), instance_name) !=
+         instances.end();
 }
 
 InstanceType get_cleanup_type(const xllm_service::InstanceMetaInfo& info) {
@@ -212,44 +661,131 @@ bool InstanceMgr::can_route_prefill_without_decode_locked(
   return true;
 }
 
-bool InstanceMgr::get_next_instance_pair(Routing* routing) {
-  std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+bool InstanceMgr::get_next_instance_pair(const std::shared_ptr<Request>& request) {
+  if (request == nullptr) {
+    LOG(ERROR) << "Request is null when selecting RR instance pair";
+    return false;
+  }
+
+  Routing* routing = &request->routing;
+  std::unique_lock<std::shared_mutex> cluster_lock(cluster_mutex_);
+  std::shared_lock<std::shared_mutex> metrics_lock(metrics_mutex_);
   if (prefill_index_.empty()) {
     LOG(ERROR) << "No prefill or default instance found!";
     return false;
   }
 
+  const bool request_is_long =
+      request->token_ids.size() >=
+      static_cast<size_t>(std::max<int32_t>(
+          0, options_.long_request_threshold_tokens()));
+  const int32_t request_tokens =
+      static_cast<int32_t>(request->token_ids.size());
+  uint64_t route_trace_sample_ordinal = 0;
+  const bool route_trace_sampled =
+      should_sample_route_trace(request_is_long, &route_trace_sample_ordinal);
+  const bool has_unschedulable_instances = !suspect_instances_.empty();
+  const std::vector<std::string> candidate_prefill_instances =
+      get_schedulable_prefill_instances(
+          instances_, prefill_index_, has_unschedulable_instances);
+  const std::vector<std::string> short_selectors =
+      parse_instance_selectors(FLAGS_static_prefill_short_instance_selectors);
+  const std::vector<std::string> long_selectors =
+      parse_instance_selectors(FLAGS_static_prefill_long_instance_selectors);
+  const std::vector<std::string> short_filtered_instances =
+      filter_prefill_instances_by_selector(candidate_prefill_instances,
+                                          short_selectors);
+  const std::vector<std::string> long_filtered_instances =
+      filter_prefill_instances_by_selector(candidate_prefill_instances,
+                                          long_selectors);
+  const std::vector<std::string>& affine_candidates =
+      request_is_long ? long_filtered_instances : short_filtered_instances;
+  const std::vector<std::string>& primary_selectors =
+      request_is_long ? long_selectors : short_selectors;
+
   routing->decode_name.clear();
+  std::string selection_reason = "rr_fast_path_no_suspect";
   if (suspect_instances_.empty()) {
     // Fast path for the common case: no suspect instances, keep plain RR.
     next_prefill_index_ = next_prefill_index_ % prefill_index_.size();
     routing->prefill_name = prefill_index_[next_prefill_index_];
     next_prefill_index_++;
 
-    if (decode_index_.empty()) {
-      return can_route_prefill_without_decode_locked(routing->prefill_name);
+    if (!decode_index_.empty()) {
+      next_decode_index_ = next_decode_index_ % decode_index_.size();
+      routing->decode_name = decode_index_[next_decode_index_];
+      next_decode_index_++;
+    }
+  } else {
+    if (!select_next_schedulable_instance(instances_,
+                                          prefill_index_,
+                                          &next_prefill_index_,
+                                          &routing->prefill_name)) {
+      LOG(ERROR) << "No schedulable prefill or default instance found!";
+      return false;
     }
 
-    next_decode_index_ = next_decode_index_ % decode_index_.size();
-    routing->decode_name = decode_index_[next_decode_index_];
-    next_decode_index_++;
-    return true;
+    if (!decode_index_.empty()) {
+      select_next_schedulable_instance(instances_,
+                                       decode_index_,
+                                       &next_decode_index_,
+                                       &routing->decode_name);
+    }
   }
 
-  if (!select_next_schedulable_instance(instances_,
-                                        prefill_index_,
-                                        &next_prefill_index_,
-                                        &routing->prefill_name)) {
-    LOG(ERROR) << "No schedulable prefill or default instance found!";
-    return false;
+  if (has_unschedulable_instances) {
+    selection_reason = "rr_schedulable_scan";
   }
 
   if (decode_index_.empty()) {
-    return can_route_prefill_without_decode_locked(routing->prefill_name);
+    if (!can_route_prefill_without_decode_locked(routing->prefill_name)) {
+      return false;
+    }
   }
 
-  select_next_schedulable_instance(
-      instances_, decode_index_, &next_decode_index_, &routing->decode_name);
+  if (route_trace_sampled) {
+    nlohmann::json selected_prefill_affine = nullptr;
+    if (!primary_selectors.empty()) {
+      selected_prefill_affine =
+          instance_in_list(affine_candidates, routing->prefill_name);
+    }
+
+    nlohmann::json candidate_breakdown = nlohmann::json::array();
+    for (const auto& prefill_instance : candidate_prefill_instances) {
+      candidate_breakdown.emplace_back(nlohmann::json{
+          {"instance", prefill_instance},
+          {"active_requests",
+           get_prefill_request_num(request_metrics_, prefill_instance)},
+          {"waiting_requests",
+           get_waiting_requests_num(load_metrics_, prefill_instance)},
+          {"combined_load",
+           get_prefill_combined_load(
+               request_metrics_, load_metrics_, prefill_instance)},
+          {"current_prefill_tokens",
+           get_prefill_token_num(request_metrics_, prefill_instance)}});
+    }
+
+    nlohmann::json route_trace_entry{
+        {"timestamp_ms", current_time_ms()},
+        {"route_path", "rr"},
+        {"selection_reason", selection_reason},
+        {"sample_ordinal", route_trace_sample_ordinal},
+        {"client_request_id", get_client_request_id(request)},
+        {"service_request_id", request->service_request_id},
+        {"request_tokens", request_tokens},
+        {"request_type", request_is_long ? "long" : "short"},
+        {"selected_prefill_instance", routing->prefill_name},
+        {"selected_prefill_instance_final", routing->prefill_name},
+        {"selected_decode_instance", routing->decode_name},
+        {"candidate_prefill_instances", candidate_prefill_instances},
+        {"short_candidates", short_filtered_instances},
+        {"long_candidates", long_filtered_instances},
+        {"affine_candidates", affine_candidates},
+        {"selected_prefill_affine", selected_prefill_affine},
+        {"candidate_breakdown", candidate_breakdown}};
+    append_route_trace_jsonl(route_trace_entry);
+  }
+
   return true;
 }
 
@@ -266,6 +802,197 @@ std::vector<std::string> InstanceMgr::get_static_decode_list(
   }
 
   return decode_list;
+}
+
+bool InstanceMgr::wait_for_decode_pressure_admission(
+    const std::shared_ptr<Request>& request) {
+  if (!FLAGS_enable_decode_pressure_admission_control) {
+    return true;
+  }
+
+  const bool use_active_cap =
+      FLAGS_decode_pressure_admission_max_active_requests > 0;
+  const bool use_estimated_tpot =
+      FLAGS_decode_pressure_admission_use_estimated_tpot;
+  if (!use_active_cap && !use_estimated_tpot) {
+    return true;
+  }
+
+  const int64_t request_tokens =
+      request == nullptr ? 0 : static_cast<int64_t>(request->token_ids.size());
+  const bool request_is_long =
+      request_tokens >= static_cast<int64_t>(
+                            std::max<int32_t>(0,
+                                              FLAGS_long_request_threshold_tokens));
+  const int64_t decode_work_tokens =
+      estimate_decode_work_tokens(request, request_tokens, request_is_long);
+  const int64_t effective_target_tpot =
+      FLAGS_decode_pressure_admission_target_tpot_ms > 0
+          ? FLAGS_decode_pressure_admission_target_tpot_ms
+          : FLAGS_target_tpot;
+  const uint64_t start_ms = current_time_ms();
+  const uint64_t timeout_ms =
+      static_cast<uint64_t>(FLAGS_decode_pressure_admission_timeout_ms);
+  int32_t attempts = 0;
+  int64_t last_best_active = -1;
+  int64_t last_best_waiting = -1;
+  int64_t last_best_estimated_tpot = -1;
+  std::string last_best_decode_instance;
+  DecodeAdmissionPressureTier last_best_pressure_tier =
+      DecodeAdmissionPressureTier::kOpen;
+
+  while (true) {
+    bool admitted = false;
+    bool has_decode_candidate = false;
+    DecodeAdmissionCandidateState best_candidate;
+    bool best_candidate_initialized = false;
+
+    {
+      std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(
+          cluster_mutex_, metrics_mutex_);
+      for (const auto& decode_instance : decode_index_) {
+        auto instance_it = instances_.find(decode_instance);
+        if (instance_it == instances_.end() ||
+            !is_instance_schedulable(instance_it->second)) {
+          continue;
+        }
+
+        has_decode_candidate = true;
+        DecodeAdmissionCandidateState candidate;
+        candidate.instance_name = decode_instance;
+        candidate.active_requests =
+            request_metrics_[decode_instance].decode_request_num;
+        candidate.waiting_requests = static_cast<int64_t>(
+            get_waiting_requests_num(load_metrics_, decode_instance));
+        const int64_t token_num =
+            request_metrics_[decode_instance].decode_token_num;
+        if (use_estimated_tpot &&
+            !instance_it->second.tpot_profiling_data.empty()) {
+          candidate.estimated_tpot_ms =
+              get_time_predictor(decode_instance)
+                  .predict_tpot(token_num + decode_work_tokens,
+                                candidate.active_requests + 1);
+          candidate.has_tpot_signal = candidate.estimated_tpot_ms > 0;
+        }
+        candidate.pressure_tier = evaluate_decode_admission_pressure_tier(
+            candidate,
+            request_is_long,
+            FLAGS_decode_pressure_admission_max_active_requests,
+            effective_target_tpot);
+
+        if (!best_candidate_initialized ||
+            candidate.pressure_tier < best_candidate.pressure_tier ||
+            (candidate.pressure_tier == best_candidate.pressure_tier &&
+             candidate.active_requests < best_candidate.active_requests) ||
+            (candidate.pressure_tier == best_candidate.pressure_tier &&
+             candidate.active_requests == best_candidate.active_requests &&
+             candidate.waiting_requests < best_candidate.waiting_requests) ||
+            (candidate.pressure_tier == best_candidate.pressure_tier &&
+             candidate.active_requests == best_candidate.active_requests &&
+             candidate.waiting_requests == best_candidate.waiting_requests &&
+             candidate.estimated_tpot_ms < best_candidate.estimated_tpot_ms)) {
+          best_candidate = candidate;
+          best_candidate_initialized = true;
+        }
+
+        if (candidate.pressure_tier == DecodeAdmissionPressureTier::kOpen) {
+          admitted = true;
+          break;
+        }
+        if (!request_is_long &&
+            candidate.pressure_tier == DecodeAdmissionPressureTier::kMedium) {
+          admitted = true;
+          break;
+        }
+      }
+    }
+
+    if (!has_decode_candidate) {
+      LOG(ERROR) << "Decode pressure admission found no schedulable decode "
+                    "instance.";
+      return false;
+    }
+    last_best_active = best_candidate_initialized ? best_candidate.active_requests
+                                                  : -1;
+    last_best_waiting = best_candidate_initialized
+                            ? best_candidate.waiting_requests
+                            : -1;
+    last_best_estimated_tpot =
+        best_candidate_initialized ? best_candidate.estimated_tpot_ms : -1;
+    last_best_decode_instance =
+        best_candidate_initialized ? best_candidate.instance_name : "";
+    last_best_pressure_tier = best_candidate_initialized
+                                  ? best_candidate.pressure_tier
+                                  : DecodeAdmissionPressureTier::kHard;
+
+    if (FLAGS_enable_decode_pressure_soft_signal_only) {
+      if (request != nullptr) {
+        request->stage_timing_trace.decode_admission_wait_ms =
+            static_cast<int64_t>(current_time_ms() - start_ms);
+        request->stage_timing_trace.decode_admission_attempts = attempts;
+        request->stage_timing_trace.decode_admission_active_requests =
+            last_best_active;
+        request->stage_timing_trace.decode_admission_waiting_requests =
+            last_best_waiting;
+        request->stage_timing_trace.decode_admission_estimated_tpot_ms =
+            last_best_estimated_tpot;
+        request->stage_timing_trace.decode_admission_pressure_tier =
+            decode_admission_pressure_tier_name(last_best_pressure_tier);
+        request->stage_timing_trace
+            .decode_admission_preferred_decode_instance =
+            last_best_decode_instance;
+      }
+      return true;
+    }
+
+    if (admitted) {
+      if (request != nullptr) {
+        request->stage_timing_trace.decode_admission_wait_ms =
+            static_cast<int64_t>(current_time_ms() - start_ms);
+        request->stage_timing_trace.decode_admission_attempts = attempts;
+        request->stage_timing_trace.decode_admission_active_requests =
+            last_best_active;
+        request->stage_timing_trace.decode_admission_waiting_requests =
+            last_best_waiting;
+        request->stage_timing_trace.decode_admission_estimated_tpot_ms =
+            last_best_estimated_tpot;
+        request->stage_timing_trace.decode_admission_pressure_tier =
+            decode_admission_pressure_tier_name(last_best_pressure_tier);
+        request->stage_timing_trace
+            .decode_admission_preferred_decode_instance =
+            last_best_decode_instance;
+      }
+      return true;
+    }
+
+    ++attempts;
+    const uint64_t waited_ms = current_time_ms() - start_ms;
+    if (waited_ms >= timeout_ms) {
+      LOG(ERROR) << "Decode pressure admission timeout after " << waited_ms
+                 << " ms, attempts=" << attempts
+                 << ", request_type=" << (request_is_long ? "long" : "short")
+                 << ", best_decode_instance=" << best_candidate.instance_name
+                 << ", best_active_requests=" << last_best_active
+                 << ", best_waiting_requests=" << last_best_waiting
+                 << ", best_estimated_tpot_ms=" << last_best_estimated_tpot;
+      return false;
+    }
+
+    if (attempts % FLAGS_decode_pressure_admission_log_every_n == 0) {
+      LOG(INFO) << "Decode pressure admission waiting, waited_ms=" << waited_ms
+                << ", attempts=" << attempts
+                << ", request_type=" << (request_is_long ? "long" : "short")
+                << ", best_decode_instance=" << best_candidate.instance_name
+                << ", best_active_requests=" << last_best_active
+                << ", best_waiting_requests=" << last_best_waiting
+                << ", best_pressure_tier="
+                << decode_admission_pressure_tier_name(last_best_pressure_tier)
+                << ", best_estimated_tpot_ms=" << last_best_estimated_tpot;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        FLAGS_decode_pressure_admission_check_interval_ms));
+  }
 }
 
 // TODO: refactor later, currently return all prefill instances
@@ -465,6 +1192,9 @@ bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
   }
 
   it->second.latest_timestamp = current_time_ms();
+  if (it->second.runtime_state == InstanceRuntimeState::REGISTERING) {
+    return true;
+  }
   if (it->second.runtime_state == InstanceRuntimeState::SUSPECT) {
     // A recovered suspect instance first goes back to LEASE_LOST and must
     // keep heartbeating before becoming fully active again via registration.
@@ -475,6 +1205,53 @@ bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
                  << ", incarnation_id: " << incarnation_id;
   }
   return true;
+}
+
+bool InstanceMgr::recover_instance_from_etcd(const std::string& instance_name,
+                                             const std::string& incarnation_id) {
+  for (const auto& it : ETCD_KEYS_PREFIX_MAP) {
+    const auto& key_prefix = it.second;
+    InstanceMetaInfo metainfo;
+    if (!etcd_client_->get(key_prefix + instance_name, &metainfo)) {
+      continue;
+    }
+    if (!incarnation_id.empty() && metainfo.incarnation_id != incarnation_id) {
+      LOG(WARNING) << "Warmtrace recover_instance_from_etcd incarnation mismatch: "
+                   << instance_name << ", etcd incarnation_id: "
+                   << metainfo.incarnation_id << ", heartbeat incarnation_id: "
+                   << incarnation_id;
+      return false;
+    }
+
+    LOG(INFO) << "Warmtrace recover_instance_from_etcd hit key_prefix="
+              << key_prefix << ", instance_name=" << instance_name
+              << ", type=" << static_cast<int>(metainfo.type)
+              << ", rpc_address=" << metainfo.rpc_address
+              << ", incarnation_id=" << metainfo.incarnation_id;
+
+    std::string old_incarnation_id;
+    {
+      std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+      auto existing_it = instances_.find(instance_name);
+      if (existing_it != instances_.end()) {
+        if (existing_it->second.incarnation_id == metainfo.incarnation_id) {
+          refresh_instance_registration(instance_name, metainfo);
+          clear_suspect_instance(instance_name, metainfo.incarnation_id);
+          return true;
+        }
+        old_incarnation_id = existing_it->second.incarnation_id;
+      }
+    }
+
+    if (!old_incarnation_id.empty()) {
+      deregister_instance(instance_name, old_incarnation_id);
+    }
+    return register_instance(instance_name, metainfo);
+  }
+
+  LOG(WARNING) << "Warmtrace recover_instance_from_etcd failed, instance not found in etcd: "
+               << instance_name << ", incarnation_id=" << incarnation_id;
+  return false;
 }
 
 bool InstanceMgr::init_brpc_channel(
@@ -556,7 +1333,9 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
 
       if (event.event_type() == etcd::Event::EventType::PUT) {
         InstanceMetaInfo metainfo;
+        LOG(INFO) << "Warmtrace service etcd PUT raw instance_name=" << instance_name << ", prefix_len=" << prefix_len;
         auto json_str = get_event_value(event);
+        LOG(INFO) << "Warmtrace service etcd PUT parse begin instance_name=" << instance_name << ", json=" << json_str;
         if (!metainfo.parse_from_json(json_str)) {
           LOG(ERROR) << "Parse instance json failed: " << json_str;
           continue;
@@ -907,25 +1686,125 @@ bool InstanceMgr::select_instance_pair_on_slo(
   std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(cluster_mutex_,
                                                               metrics_mutex_);
   const bool has_unschedulable_instances = !suspect_instances_.empty();
+  const bool request_is_long =
+      request->token_ids.size() >=
+      static_cast<size_t>(std::max<int32_t>(
+          0, options_.long_request_threshold_tokens()));
+  const int32_t request_tokens = static_cast<int32_t>(request->token_ids.size());
+  const int64_t decode_work_tokens =
+      estimate_decode_work_tokens(request, request_tokens, request_is_long);
+  const int32_t hard_long_threshold =
+      std::max<int32_t>(0, options_.long_request_threshold_tokens());
+  const int32_t v0_3_soft_long_lower_tokens =
+      resolve_v0_3_soft_long_lower_tokens(hard_long_threshold);
+  const int32_t v0_3_soft_long_upper_tokens =
+      resolve_v0_3_soft_long_upper_tokens(hard_long_threshold,
+                                          v0_3_soft_long_lower_tokens);
+  const double v0_3_long_request_scale = compute_v0_3_long_request_scale(
+      request_tokens, v0_3_soft_long_lower_tokens, v0_3_soft_long_upper_tokens);
+  const double v0_3_short_request_scale = 1.0 - v0_3_long_request_scale;
+  const bool use_v0_3_family_scoring = use_hybrid_prefill_scoring_v0_3_family();
+  const bool use_v0_3a_scoring = use_hybrid_prefill_scoring_v0_3a();
+  const bool use_v0_3b_scoring = use_hybrid_prefill_scoring_v0_3b();
+  const bool use_v0_3c_scoring = use_hybrid_prefill_scoring_v0_3c();
+  std::vector<std::string> all_prefill_instances =
+      get_schedulable_prefill_instances(
+          instances_, prefill_index_, has_unschedulable_instances);
+  std::vector<std::string> candidate_prefill_instances = all_prefill_instances;
+  const bool enable_affinity_routing =
+      FLAGS_enable_hybrid_prefill_affinity_routing;
+  uint64_t hybrid_route_decision_ordinal = 0;
+  uint64_t hybrid_route_elapsed_ms = 0;
+  static std::atomic<int32_t> consecutive_short_long_borrow_counter{0};
+  if (enable_affinity_routing) {
+    static const uint64_t hybrid_route_guard_start_ms = current_time_ms();
+    static std::atomic<uint64_t> hybrid_route_decision_counter{0};
+    hybrid_route_decision_ordinal =
+        hybrid_route_decision_counter.fetch_add(1, std::memory_order_relaxed) +
+        1;
+    const uint64_t now_ms = current_time_ms();
+    hybrid_route_elapsed_ms = now_ms >= hybrid_route_guard_start_ms
+                                  ? now_ms - hybrid_route_guard_start_ms
+                                  : 0;
+  }
+  bool static_soft_fallback_triggered = false;
+  int64_t static_primary_min_prefill_request_num = 0;
+  int64_t static_opposite_min_prefill_request_num = 0;
+  int64_t static_primary_min_prefill_token_num = 0;
+  int64_t static_opposite_min_prefill_token_num = 0;
+  const std::vector<std::string> short_selectors =
+      parse_instance_selectors(FLAGS_static_prefill_short_instance_selectors);
+  const std::vector<std::string> long_selectors =
+      parse_instance_selectors(FLAGS_static_prefill_long_instance_selectors);
+  const std::vector<std::string> short_filtered_instances =
+      filter_prefill_instances_by_selector(all_prefill_instances,
+                                           short_selectors);
+  const std::vector<std::string> long_filtered_instances =
+      filter_prefill_instances_by_selector(all_prefill_instances,
+                                           long_selectors);
+  const std::vector<std::string>& primary_selectors =
+      request_is_long ? long_selectors : short_selectors;
+  const std::vector<std::string>& opposite_selectors =
+      request_is_long ? short_selectors : long_selectors;
+  const std::vector<std::string>& primary_filtered_instances =
+      request_is_long ? long_filtered_instances : short_filtered_instances;
+  const std::vector<std::string>& opposite_filtered_instances =
+      request_is_long ? short_filtered_instances : long_filtered_instances;
+  if (FLAGS_enable_static_prefill_instance_split && !enable_affinity_routing) {
+    if (!primary_filtered_instances.empty()) {
+      candidate_prefill_instances = primary_filtered_instances;
+    } else if (!primary_selectors.empty()) {
+      LOG_EVERY_N(WARNING, 20)
+          << "Static prefill split enabled, but no candidate instance matched "
+          << (request_is_long ? "long" : "short")
+          << " selectors. Fall back to all schedulable prefill instances. "
+          << "selectors=" << absl::StrJoin(primary_selectors, ",");
+    }
+
+    if (FLAGS_enable_static_prefill_soft_fallback &&
+        !primary_filtered_instances.empty() &&
+        !opposite_filtered_instances.empty()) {
+      static_primary_min_prefill_request_num = min_prefill_request_num(
+          primary_filtered_instances, request_metrics_);
+      static_opposite_min_prefill_request_num = min_prefill_request_num(
+          opposite_filtered_instances, request_metrics_);
+      static_primary_min_prefill_token_num = min_prefill_token_num(
+          primary_filtered_instances, request_metrics_);
+      static_opposite_min_prefill_token_num = min_prefill_token_num(
+          opposite_filtered_instances, request_metrics_);
+
+      const bool request_gap_triggered =
+          static_primary_min_prefill_request_num >
+          static_opposite_min_prefill_request_num +
+              FLAGS_static_prefill_soft_fallback_request_num_gap;
+      const bool token_gap_triggered =
+          static_primary_min_prefill_token_num >
+          static_opposite_min_prefill_token_num +
+              FLAGS_static_prefill_soft_fallback_token_gap;
+      if (request_gap_triggered || token_gap_triggered) {
+        candidate_prefill_instances = merge_unique_instance_lists(
+            primary_filtered_instances, opposite_filtered_instances);
+        static_soft_fallback_triggered = true;
+      }
+    }
+  }
 
   std::string min_prefill_instance;
   int64_t min_prefill_time = std::numeric_limits<int64_t>::max();
   int64_t total_prefill_time = 0;
   size_t schedulable_prefill_count = 0;
-  for (const auto& prefill_instance : prefill_index_) {
-    if (has_unschedulable_instances) {
-      auto it = instances_.find(prefill_instance);
-      if (it == instances_.end() || !is_instance_schedulable(it->second)) {
-        continue;
-      }
-    }
-
+  std::vector<std::string> min_prefill_candidates;
+  for (const auto& prefill_instance : candidate_prefill_instances) {
     int64_t prefill_time =
         request_metrics_[prefill_instance].estimated_prefill_time;
     total_prefill_time += prefill_time;
     if (prefill_time < min_prefill_time) {
       min_prefill_instance = prefill_instance;
       min_prefill_time = prefill_time;
+      min_prefill_candidates.clear();
+      min_prefill_candidates.emplace_back(prefill_instance);
+    } else if (prefill_time == min_prefill_time) {
+      min_prefill_candidates.emplace_back(prefill_instance);
     }
     ++schedulable_prefill_count;
   }
@@ -975,6 +1854,1342 @@ bool InstanceMgr::select_instance_pair_on_slo(
     request->routing.decode_name = min_decode_instance;
   }
 
+  std::string selected_prefill_instance = min_prefill_instance;
+  size_t min_prefill_token_tie_count = min_prefill_candidates.size();
+  size_t min_prefill_request_tie_count = min_prefill_candidates.size();
+  size_t min_prefill_waiting_tie_count = min_prefill_candidates.size();
+  double selected_prefill_score = std::numeric_limits<double>::lowest();
+  double selected_prefill_score_v0_2 = std::numeric_limits<double>::lowest();
+  double selected_prefill_score_v0_3 = std::numeric_limits<double>::lowest();
+  double selected_affinity_bonus = 0.0;
+  double selected_rescue_bonus = 0.0;
+  double selected_boundary_long_escape_bonus = 0.0;
+  double selected_long_affine_busy_penalty = 0.0;
+  bool selected_long_affine_busy_admission_guarded = false;
+  double selected_long_affinity_base_bonus = 0.0;
+  double selected_dynamic_long_affinity_bonus = 0.0;
+  double selected_effective_long_affinity_bonus = 0.0;
+  double selected_dynamic_load_gain = 0.0;
+  double selected_dynamic_time_gain = 0.0;
+  double selected_request_penalty = 0.0;
+  double selected_waiting_penalty = 0.0;
+  double selected_token_penalty = 0.0;
+  double selected_prefill_time_penalty = 0.0;
+  uint64_t selected_combined_load = 0;
+  bool affine_pool_overloaded = false;
+  bool rescue_token_eligible = false;
+  uint64_t affine_pool_min_combined_load = 0;
+  uint64_t opposite_pool_min_combined_load = 0;
+  int64_t pool_min_combined_load_gap = 0;
+  int64_t affine_pool_min_projected_prefill_time = 0;
+  int64_t opposite_pool_min_projected_prefill_time = 0;
+  bool has_affine_pool_projected_prefill_time = false;
+  bool has_opposite_pool_projected_prefill_time = false;
+  double dynamic_long_request_token_cost_load_gain = 0.0;
+  double dynamic_long_request_token_cost_time_gain = 0.0;
+  double dynamic_long_request_token_cost_gap_gain = 0.0;
+  double dynamic_long_request_token_cost_multiplier =
+      FLAGS_long_request_token_cost_multiplier;
+  bool selected_prefill_affine = false;
+  bool selected_prefill_short_to_long_lane = false;
+  int32_t consecutive_short_long_borrows_before_route = 0;
+  int32_t consecutive_short_long_borrows_after_route = 0;
+  std::string selected_candidate_summary;
+  std::string hybrid_candidate_summaries;
+  uint64_t route_trace_sample_ordinal = 0;
+  bool route_trace_sampled =
+      should_sample_route_trace(request_is_long, &route_trace_sample_ordinal);
+  nlohmann::json route_trace_candidate_breakdown = nlohmann::json::array();
+  nlohmann::json dynamic_cp_shadow_candidate_breakdown =
+      nlohmann::json::array();
+  std::vector<std::string> hybrid_best_candidates_for_trace;
+  struct DynamicCpShadowCandidate {
+    std::string prefill_instance;
+    std::string decode_instance;
+    std::string lane_type;
+    double cost = std::numeric_limits<double>::max();
+    double prefill_cost = 0.0;
+    double decode_pressure_cost = 0.0;
+    double cp_benefit = 0.0;
+    double interference_cost = 0.0;
+    int64_t projected_prefill_time = 0;
+    int64_t projected_prefill_tokens = 0;
+    int64_t predicted_request_ttft = 0;
+    int64_t active_requests = 0;
+    uint64_t waiting_requests = 0;
+    uint64_t combined_load = 0;
+    int64_t decode_active_requests = -1;
+    int64_t decode_waiting_requests = -1;
+    int64_t decode_estimated_tpot_ms = -1;
+  };
+  bool dynamic_cp_shadow_has_selected = false;
+  DynamicCpShadowCandidate dynamic_cp_shadow_selected_candidate;
+  const bool dynamic_cp_shadow_enabled =
+      FLAGS_enable_dynamic_cp_pricing_shadow;
+  const bool dynamic_cp_takeover_enabled =
+      dynamic_cp_shadow_enabled && FLAGS_enable_dynamic_cp_pricing_takeover;
+  const bool dynamic_cp_decode_takeover_enabled =
+      dynamic_cp_takeover_enabled &&
+      FLAGS_enable_dynamic_cp_pricing_decode_takeover;
+  const std::string decode_admission_preferred_decode =
+      request->stage_timing_trace.decode_admission_preferred_decode_instance;
+
+  auto dynamic_cp_shadow_lane_type =
+      [&](const std::string& prefill_instance) -> std::string {
+    const bool short_affine =
+        short_filtered_instances.empty() ||
+        instance_in_list(short_filtered_instances, prefill_instance);
+    const bool long_affine =
+        long_filtered_instances.empty() ||
+        instance_in_list(long_filtered_instances, prefill_instance);
+    if (long_affine && short_affine) {
+      return "shared";
+    }
+    if (long_affine) {
+      return "long";
+    }
+    if (short_affine) {
+      return "short";
+    }
+    return "unclassified";
+  };
+
+  auto dynamic_cp_shadow_decode_cost =
+      [&](const std::string& decode_instance,
+          DynamicCpShadowCandidate* candidate) -> double {
+    if (decode_instance.empty()) {
+      return 0.0;
+    }
+    const auto metrics_it = request_metrics_.find(decode_instance);
+    if (metrics_it == request_metrics_.end()) {
+      return 0.0;
+    }
+    const int64_t active_requests = metrics_it->second.decode_request_num;
+    const int64_t waiting_requests = static_cast<int64_t>(
+        get_waiting_requests_num(load_metrics_, decode_instance));
+    const int64_t token_num = metrics_it->second.decode_token_num;
+    int64_t estimated_tpot_ms = -1;
+    const auto instance_it = instances_.find(decode_instance);
+    if (instance_it != instances_.end() &&
+        !instance_it->second.tpot_profiling_data.empty()) {
+      estimated_tpot_ms =
+          get_time_predictor(decode_instance)
+              .predict_tpot(token_num + decode_work_tokens,
+                            active_requests + 1);
+    }
+    if (candidate != nullptr) {
+      candidate->decode_active_requests = active_requests;
+      candidate->decode_waiting_requests = waiting_requests;
+      candidate->decode_estimated_tpot_ms = estimated_tpot_ms;
+    }
+    const int64_t effective_target_tpot =
+        FLAGS_decode_pressure_admission_target_tpot_ms > 0
+            ? FLAGS_decode_pressure_admission_target_tpot_ms
+            : FLAGS_target_tpot;
+    const double tpot_overflow =
+        estimated_tpot_ms > 0 && effective_target_tpot > 0
+            ? std::max(0.0,
+                       static_cast<double>(estimated_tpot_ms -
+                                           effective_target_tpot))
+            : 0.0;
+    return static_cast<double>(active_requests) *
+               FLAGS_dynamic_cp_pricing_active_weight +
+           static_cast<double>(waiting_requests) *
+               FLAGS_dynamic_cp_pricing_waiting_weight +
+           tpot_overflow * FLAGS_dynamic_cp_pricing_decode_tpot_weight;
+  };
+
+  auto evaluate_dynamic_cp_shadow_candidate =
+      [&](const std::string& prefill_instance)
+      -> DynamicCpShadowCandidate {
+    DynamicCpShadowCandidate candidate;
+    candidate.prefill_instance = prefill_instance;
+    candidate.decode_instance = decode_admission_preferred_decode.empty()
+                                    ? request->routing.decode_name
+                                    : decode_admission_preferred_decode;
+    candidate.lane_type = dynamic_cp_shadow_lane_type(prefill_instance);
+    candidate.active_requests =
+        get_prefill_request_num(request_metrics_, prefill_instance);
+    candidate.waiting_requests =
+        get_waiting_requests_num(load_metrics_, prefill_instance);
+    candidate.combined_load = get_prefill_combined_load(
+        request_metrics_, load_metrics_, prefill_instance);
+    const int64_t current_prefill_tokens =
+        get_prefill_token_num(request_metrics_, prefill_instance);
+    candidate.predicted_request_ttft =
+        get_time_predictor(prefill_instance).predict_ttft(request_tokens);
+    candidate.projected_prefill_tokens =
+        current_prefill_tokens + request_tokens;
+    candidate.projected_prefill_time =
+        request_metrics_[prefill_instance].estimated_prefill_time +
+        candidate.predicted_request_ttft;
+    candidate.prefill_cost =
+        static_cast<double>(candidate.projected_prefill_time) *
+            FLAGS_dynamic_cp_pricing_prefill_time_weight +
+        static_cast<double>(candidate.projected_prefill_tokens) *
+            FLAGS_dynamic_cp_pricing_token_weight +
+        static_cast<double>(candidate.active_requests) *
+            FLAGS_dynamic_cp_pricing_active_weight +
+        static_cast<double>(candidate.waiting_requests) *
+            FLAGS_dynamic_cp_pricing_waiting_weight;
+
+    const bool short_affine =
+        short_filtered_instances.empty() ||
+        instance_in_list(short_filtered_instances, prefill_instance);
+    const bool long_affine =
+        long_filtered_instances.empty() ||
+        instance_in_list(long_filtered_instances, prefill_instance);
+    const bool long_to_short_lane =
+        request_is_long && short_affine && !long_affine;
+    if (long_to_short_lane) {
+      const uint64_t threshold = static_cast<uint64_t>(
+          FLAGS_hybrid_prefill_long_short_pool_busy_combined_load_threshold);
+      const double load_over_threshold =
+          threshold > 0
+              ? std::max(0.0,
+                         static_cast<double>(candidate.combined_load) -
+                             static_cast<double>(threshold))
+              : static_cast<double>(candidate.combined_load);
+      candidate.interference_cost =
+          (load_over_threshold +
+           FLAGS_hybrid_prefill_long_short_pool_busy_surcharge +
+           FLAGS_hybrid_prefill_long_short_pool_affine_gap_penalty) *
+          FLAGS_dynamic_cp_pricing_interference_weight;
+    }
+    if (request_is_long && long_affine &&
+        has_opposite_pool_projected_prefill_time &&
+        opposite_pool_min_projected_prefill_time >
+            candidate.projected_prefill_time) {
+      candidate.cp_benefit =
+          static_cast<double>(opposite_pool_min_projected_prefill_time -
+                              candidate.projected_prefill_time) *
+          FLAGS_dynamic_cp_pricing_cp_benefit_weight;
+    }
+    candidate.decode_pressure_cost =
+        dynamic_cp_shadow_decode_cost(candidate.decode_instance, &candidate);
+    candidate.cost = candidate.prefill_cost + candidate.decode_pressure_cost +
+                     candidate.interference_cost - candidate.cp_benefit;
+    return candidate;
+  };
+
+  auto dynamic_cp_shadow_candidate_to_json =
+      [&](const DynamicCpShadowCandidate& candidate) -> nlohmann::json {
+    return nlohmann::json{
+        {"prefill_instance", candidate.prefill_instance},
+        {"decode_instance", candidate.decode_instance},
+        {"lane_type", candidate.lane_type},
+        {"cost", candidate.cost},
+        {"prefill_cost", candidate.prefill_cost},
+        {"decode_pressure_cost", candidate.decode_pressure_cost},
+        {"cp_benefit", candidate.cp_benefit},
+        {"interference_cost", candidate.interference_cost},
+        {"projected_prefill_time_ms", candidate.projected_prefill_time},
+        {"projected_prefill_tokens", candidate.projected_prefill_tokens},
+        {"predicted_request_ttft_ms", candidate.predicted_request_ttft},
+        {"active_requests", candidate.active_requests},
+        {"waiting_requests", candidate.waiting_requests},
+        {"combined_load", candidate.combined_load},
+        {"decode_active_requests", candidate.decode_active_requests},
+        {"decode_waiting_requests", candidate.decode_waiting_requests},
+        {"decode_estimated_tpot_ms", candidate.decode_estimated_tpot_ms}};
+  };
+  if (enable_affinity_routing) {
+    rescue_token_eligible =
+        request_tokens >= FLAGS_hybrid_prefill_rescue_min_tokens &&
+        request_tokens <= FLAGS_hybrid_prefill_rescue_max_tokens;
+
+    struct HybridCandidateScore {
+      double score = std::numeric_limits<double>::lowest();
+      double score_v0_2 = std::numeric_limits<double>::lowest();
+      double score_v0_3 = std::numeric_limits<double>::lowest();
+      double affinity_bonus = 0.0;
+      double affinity_bonus_v0_2 = 0.0;
+      double affinity_bonus_v0_3 = 0.0;
+      double long_affinity_base_bonus = 0.0;
+      double dynamic_long_affinity_bonus = 0.0;
+      double effective_long_affinity_bonus = 0.0;
+      double dynamic_load_gain = 0.0;
+      double dynamic_time_gain = 0.0;
+      double rescue_bonus = 0.0;
+      double short_long_lane_penalty = 0.0;
+      double score_before_short_long_lane_penalty = 0.0;
+      double decode_pressure_route_cost = 0.0;
+      double score_before_decode_pressure_route_cost = 0.0;
+      double long_short_pool_busy_surcharge = 0.0;
+      bool long_short_pool_busy_surcharge_guarded = false;
+      bool long_short_pool_continuous_surcharge_enabled = false;
+      double long_short_pool_affine_gap_penalty = 0.0;
+      bool long_short_pool_affine_gap_penalty_guarded = false;
+      double request_penalty = 0.0;
+      double waiting_penalty = 0.0;
+      double token_penalty = 0.0;
+      double token_penalty_v0_2 = 0.0;
+      double token_penalty_v0_3 = 0.0;
+      double boundary_long_escape_bonus_v0_3 = 0.0;
+      double long_affine_busy_penalty = 0.0;
+      double prefill_time_penalty = 0.0;
+      double prefill_time_penalty_v0_2 = 0.0;
+      double prefill_time_penalty_v0_3 = 0.0;
+      double normalized_projected_prefill_time_penalty = 0.0;
+      uint64_t combined_load = 0;
+      uint64_t waiting_requests = 0;
+      int64_t active_requests = 0;
+      int64_t current_prefill_tokens = 0;
+      int64_t prefill_time = 0;
+      int64_t predicted_request_ttft = 0;
+      int64_t projected_prefill_tokens = 0;
+      int64_t projected_prefill_time = 0;
+      bool is_affine = false;
+      bool is_short_affine = false;
+      bool is_long_affine = false;
+      double v0_3_long_request_scale = 0.0;
+      double v0_3_short_request_scale = 0.0;
+      double request_token_cost_multiplier_v0_2 = 1.0;
+      double request_token_cost_multiplier_v0_3 = 1.0;
+      bool is_short_to_long_lane = false;
+      bool long_affine_busy_admission_guarded = false;
+      bool short_long_lane_guarded = false;
+      bool consecutive_borrow_cap_guard = false;
+      std::string short_long_lane_guard_reason;
+    };
+
+    affine_pool_min_combined_load = 0;
+    bool has_affine_candidates = false;
+    for (const auto& prefill_instance : primary_filtered_instances) {
+      const uint64_t combined_load =
+          get_prefill_combined_load(request_metrics_, load_metrics_,
+                                    prefill_instance);
+      if (!has_affine_candidates || combined_load < affine_pool_min_combined_load) {
+        affine_pool_min_combined_load = combined_load;
+      }
+      has_affine_candidates = true;
+    }
+    if (!opposite_filtered_instances.empty()) {
+      opposite_pool_min_combined_load = min_prefill_combined_load(
+          opposite_filtered_instances, request_metrics_, load_metrics_);
+    }
+    if (has_affine_candidates && !opposite_filtered_instances.empty()) {
+      pool_min_combined_load_gap =
+          static_cast<int64_t>(affine_pool_min_combined_load) -
+          static_cast<int64_t>(opposite_pool_min_combined_load);
+    }
+    affine_pool_overloaded =
+        has_affine_candidates && FLAGS_hybrid_prefill_overload_threshold > 0 &&
+        affine_pool_min_combined_load >=
+            static_cast<uint64_t>(FLAGS_hybrid_prefill_overload_threshold);
+    dynamic_long_request_token_cost_multiplier =
+        FLAGS_long_request_token_cost_multiplier;
+    if (request_is_long && has_affine_candidates &&
+        FLAGS_dynamic_long_request_token_cost_enabled) {
+      const double load_gain_window = static_cast<double>(
+          FLAGS_dynamic_long_request_token_cost_load_gain_window);
+      if (load_gain_window > 0.0 &&
+          FLAGS_dynamic_long_request_token_cost_overload_threshold > 0) {
+        dynamic_long_request_token_cost_load_gain = clamp_unit_interval(
+            (static_cast<double>(affine_pool_min_combined_load) -
+             static_cast<double>(
+                 FLAGS_dynamic_long_request_token_cost_overload_threshold)) /
+            load_gain_window);
+      } else if (FLAGS_dynamic_long_request_token_cost_overload_threshold == 0) {
+        dynamic_long_request_token_cost_load_gain = 1.0;
+      }
+      if (load_gain_window > 0.0 && pool_min_combined_load_gap > 0) {
+        dynamic_long_request_token_cost_gap_gain = clamp_unit_interval(
+            static_cast<double>(pool_min_combined_load_gap) / load_gain_window);
+      }
+    }
+    has_affine_pool_projected_prefill_time = false;
+    has_opposite_pool_projected_prefill_time = false;
+
+    auto compute_decode_pressure_route_cost =
+        [&](int64_t projected_prefill_time_ms) -> double {
+      if (!FLAGS_enable_decode_pressure_route_score ||
+          FLAGS_decode_pressure_route_score_weight <= 0.0) {
+        return 0.0;
+      }
+      const std::string decode_instance =
+          request->stage_timing_trace.decode_admission_preferred_decode_instance
+                  .empty()
+              ? request->routing.decode_name
+              : request->stage_timing_trace
+                    .decode_admission_preferred_decode_instance;
+      if (decode_instance.empty()) {
+        return 0.0;
+      }
+      const auto metrics_it = request_metrics_.find(decode_instance);
+      if (metrics_it == request_metrics_.end()) {
+        return 0.0;
+      }
+      const int64_t active_requests = metrics_it->second.decode_request_num;
+      const int64_t waiting_requests = static_cast<int64_t>(
+          get_waiting_requests_num(load_metrics_, decode_instance));
+      int64_t estimated_tpot_ms = -1;
+      const auto instance_it = instances_.find(decode_instance);
+      if (instance_it != instances_.end() &&
+          !instance_it->second.tpot_profiling_data.empty()) {
+        estimated_tpot_ms =
+            get_time_predictor(decode_instance)
+                .predict_tpot(metrics_it->second.decode_token_num +
+                                  decode_work_tokens,
+                              active_requests + 1);
+      }
+      const int64_t effective_target_tpot =
+          FLAGS_decode_pressure_admission_target_tpot_ms > 0
+              ? FLAGS_decode_pressure_admission_target_tpot_ms
+              : FLAGS_target_tpot;
+      const double tpot_overflow =
+          estimated_tpot_ms > 0 && effective_target_tpot > 0
+              ? std::max(0.0,
+                         static_cast<double>(estimated_tpot_ms -
+                                             effective_target_tpot))
+              : 0.0;
+      double raw_cost =
+          static_cast<double>(active_requests) *
+              FLAGS_decode_pressure_route_active_weight +
+          static_cast<double>(waiting_requests) *
+              FLAGS_decode_pressure_route_waiting_weight +
+          tpot_overflow * FLAGS_decode_pressure_route_estimated_tpot_weight;
+      if (FLAGS_decode_pressure_route_prefill_delay_decay_ms > 0 &&
+          projected_prefill_time_ms > 0) {
+        raw_cost *= std::exp(
+            -static_cast<double>(projected_prefill_time_ms) /
+            static_cast<double>(
+                FLAGS_decode_pressure_route_prefill_delay_decay_ms));
+      }
+      double aging_credit = 0.0;
+      if (request_is_long &&
+          FLAGS_decode_pressure_admission_long_rescue_wait_ms > 0 &&
+          FLAGS_decode_pressure_route_long_aging_credit_weight > 0.0) {
+        aging_credit =
+            static_cast<double>(
+                request->stage_timing_trace.decode_admission_wait_ms) /
+            static_cast<double>(
+                FLAGS_decode_pressure_admission_long_rescue_wait_ms) *
+            FLAGS_decode_pressure_route_long_aging_credit_weight;
+        if (FLAGS_decode_pressure_route_long_aging_credit_cap > 0.0) {
+          aging_credit = std::min(
+              aging_credit, FLAGS_decode_pressure_route_long_aging_credit_cap);
+        }
+      }
+      return std::max(0.0,
+                      raw_cost * FLAGS_decode_pressure_route_score_weight -
+                          aging_credit);
+    };
+
+    auto evaluate_hybrid_candidate =
+        [&](const std::string& prefill_instance) -> HybridCandidateScore {
+      HybridCandidateScore candidate;
+      candidate.is_affine =
+          primary_filtered_instances.empty() ||
+          instance_in_list(primary_filtered_instances, prefill_instance);
+      candidate.is_short_affine =
+          short_filtered_instances.empty() ||
+          instance_in_list(short_filtered_instances, prefill_instance);
+      candidate.is_long_affine =
+          long_filtered_instances.empty() ||
+          instance_in_list(long_filtered_instances, prefill_instance);
+      candidate.active_requests =
+          get_prefill_request_num(request_metrics_, prefill_instance);
+      candidate.waiting_requests =
+          get_waiting_requests_num(load_metrics_, prefill_instance);
+      candidate.current_prefill_tokens =
+          get_prefill_token_num(request_metrics_, prefill_instance);
+      candidate.combined_load = get_prefill_combined_load(
+          request_metrics_, load_metrics_, prefill_instance);
+      const uint64_t rescue_load_gap =
+          static_cast<uint64_t>(FLAGS_hybrid_prefill_rescue_load_gap);
+      const bool rescue_load_advantaged =
+          !candidate.is_affine &&
+          candidate.combined_load + rescue_load_gap <=
+              affine_pool_min_combined_load;
+      if (!candidate.is_affine && affine_pool_overloaded &&
+          rescue_token_eligible && rescue_load_advantaged) {
+        candidate.rescue_bonus = FLAGS_hybrid_prefill_rescue_bonus;
+      }
+      candidate.is_short_to_long_lane =
+          !request_is_long && candidate.is_long_affine &&
+          !candidate.is_short_affine;
+      const bool candidate_is_long_to_short_pool =
+          request_is_long && candidate.is_short_affine &&
+          !candidate.is_long_affine;
+      if (request_is_long && candidate.is_affine && candidate.is_long_affine &&
+          FLAGS_enable_hybrid_prefill_long_affine_busy_admission &&
+          FLAGS_hybrid_prefill_long_affine_busy_combined_load_threshold > 0 &&
+          candidate.combined_load >=
+              static_cast<uint64_t>(
+                  FLAGS_hybrid_prefill_long_affine_busy_combined_load_threshold)) {
+        candidate.long_affine_busy_admission_guarded = true;
+        candidate.long_affine_busy_penalty =
+            FLAGS_hybrid_prefill_long_affine_busy_penalty;
+      }
+      if (candidate_is_long_to_short_pool &&
+          FLAGS_enable_hybrid_prefill_long_short_pool_busy_surcharge &&
+          candidate.combined_load >=
+              static_cast<uint64_t>(
+                  FLAGS_hybrid_prefill_long_short_pool_busy_combined_load_threshold)) {
+        candidate.long_short_pool_busy_surcharge_guarded = true;
+        if (FLAGS_enable_hybrid_prefill_long_short_pool_continuous_surcharge) {
+          candidate.long_short_pool_continuous_surcharge_enabled = true;
+          candidate.long_short_pool_busy_surcharge =
+              FLAGS_hybrid_prefill_long_short_pool_busy_surcharge_alpha *
+              std::max(
+                  0.0,
+                  static_cast<double>(candidate.combined_load) -
+                      static_cast<double>(
+                          FLAGS_hybrid_prefill_long_short_pool_busy_combined_load_threshold));
+        } else {
+          candidate.long_short_pool_busy_surcharge =
+              FLAGS_hybrid_prefill_long_short_pool_busy_surcharge;
+        }
+      }
+      if (candidate_is_long_to_short_pool &&
+          has_affine_candidates &&
+          FLAGS_enable_hybrid_prefill_long_short_pool_affine_gap_penalty) {
+        const uint64_t required_gap = static_cast<uint64_t>(
+            FLAGS_hybrid_prefill_long_short_pool_affine_gap_threshold);
+        const bool lacks_clear_load_advantage =
+            candidate.combined_load + required_gap >=
+            affine_pool_min_combined_load;
+        if (lacks_clear_load_advantage) {
+          candidate.long_short_pool_affine_gap_penalty_guarded = true;
+          candidate.long_short_pool_affine_gap_penalty =
+              FLAGS_hybrid_prefill_long_short_pool_affine_gap_penalty;
+        }
+      }
+      if (candidate.is_short_to_long_lane) {
+        const bool early_time_guard =
+            FLAGS_hybrid_prefill_short_long_lane_guard_window_ms > 0 &&
+            hybrid_route_elapsed_ms <
+                static_cast<uint64_t>(
+                    FLAGS_hybrid_prefill_short_long_lane_guard_window_ms);
+        const bool early_count_guard =
+            FLAGS_hybrid_prefill_short_long_lane_guard_request_count > 0 &&
+            hybrid_route_decision_ordinal <=
+                static_cast<uint64_t>(
+                    FLAGS_hybrid_prefill_short_long_lane_guard_request_count);
+        const bool long_lane_busy_guard =
+            candidate.combined_load >
+            static_cast<uint64_t>(
+                FLAGS_hybrid_prefill_short_long_lane_guard_max_long_lane_combined_load);
+        const bool primary_not_busy_guard =
+            FLAGS_hybrid_prefill_short_long_lane_guard_primary_min_load_threshold >
+                0 &&
+            has_affine_candidates &&
+            affine_pool_min_combined_load <
+                static_cast<uint64_t>(
+                    FLAGS_hybrid_prefill_short_long_lane_guard_primary_min_load_threshold);
+        const bool prompt_too_large_guard =
+            FLAGS_hybrid_prefill_short_long_lane_guard_max_prompt_tokens > 0 &&
+            request_tokens >
+                FLAGS_hybrid_prefill_short_long_lane_guard_max_prompt_tokens;
+        const bool consecutive_borrow_cap_guard =
+            FLAGS_hybrid_prefill_short_long_lane_guard_max_consecutive_borrows >
+                0 &&
+            consecutive_short_long_borrows_before_route >=
+                FLAGS_hybrid_prefill_short_long_lane_guard_max_consecutive_borrows;
+        candidate.consecutive_borrow_cap_guard = consecutive_borrow_cap_guard;
+        if (FLAGS_enable_hybrid_prefill_short_long_lane_guard &&
+            (early_time_guard || early_count_guard || long_lane_busy_guard ||
+             primary_not_busy_guard || prompt_too_large_guard ||
+             consecutive_borrow_cap_guard)) {
+          candidate.short_long_lane_guarded = true;
+          std::vector<std::string> reasons;
+          if (early_time_guard) {
+            reasons.emplace_back("early_time");
+          }
+          if (early_count_guard) {
+            reasons.emplace_back("early_count");
+          }
+          if (long_lane_busy_guard) {
+            reasons.emplace_back("long_lane_busy");
+          }
+          if (primary_not_busy_guard) {
+            reasons.emplace_back("primary_short_lane_available");
+          }
+          if (prompt_too_large_guard) {
+            reasons.emplace_back("prompt_too_large");
+          }
+          candidate.short_long_lane_guard_reason = absl::StrJoin(reasons, ",");
+        }
+        candidate.short_long_lane_penalty =
+            FLAGS_hybrid_prefill_short_long_lane_penalty;
+      }
+      candidate.request_penalty =
+          static_cast<double>(candidate.active_requests) *
+          FLAGS_hybrid_prefill_request_num_weight;
+      candidate.waiting_penalty =
+          static_cast<double>(candidate.waiting_requests) *
+          FLAGS_hybrid_prefill_waiting_requests_weight;
+      candidate.prefill_time =
+          request_metrics_[prefill_instance].estimated_prefill_time;
+      candidate.predicted_request_ttft =
+          get_time_predictor(prefill_instance).predict_ttft(request_tokens);
+      candidate.projected_prefill_tokens =
+          candidate.current_prefill_tokens + request_tokens;
+      candidate.projected_prefill_time =
+          candidate.prefill_time + candidate.predicted_request_ttft;
+      candidate.normalized_projected_prefill_time_penalty =
+          lane_normalized_projected_prefill_time_penalty(
+              candidate.projected_prefill_time, candidate.is_long_affine,
+              candidate.is_short_affine);
+      if (request_is_long &&
+          FLAGS_hybrid_prefill_dynamic_long_affinity_gain_enabled &&
+          candidate.is_affine) {
+        const double load_gain_window = static_cast<double>(
+            FLAGS_hybrid_prefill_dynamic_load_gain_window);
+        if (load_gain_window > 0.0 &&
+            FLAGS_hybrid_prefill_overload_threshold > 0) {
+          candidate.dynamic_load_gain = clamp_unit_interval(
+              (static_cast<double>(affine_pool_min_combined_load) -
+               static_cast<double>(FLAGS_hybrid_prefill_overload_threshold)) /
+              load_gain_window);
+        }
+        candidate.long_affinity_base_bonus =
+            FLAGS_hybrid_prefill_long_affinity_base_bonus;
+        candidate.effective_long_affinity_bonus =
+            candidate.long_affinity_base_bonus;
+      }
+      candidate.request_token_cost_multiplier_v0_2 =
+          request_is_long ? dynamic_long_request_token_cost_multiplier : 1.0;
+      candidate.token_penalty_v0_2 =
+          static_cast<double>(candidate.current_prefill_tokens) *
+          FLAGS_hybrid_prefill_token_num_weight *
+          candidate.request_token_cost_multiplier_v0_2;
+      candidate.prefill_time_penalty_v0_2 =
+          candidate.normalized_projected_prefill_time_penalty +
+          (FLAGS_enable_lane_specific_projected_prefill_time_route_signal
+              ? static_cast<double>(candidate.projected_prefill_time) *
+                    (candidate.is_long_affine
+                         ? FLAGS_hybrid_prefill_long_lane_projected_prefill_time_weight
+                         : (candidate.is_short_affine
+                                ? FLAGS_hybrid_prefill_short_pool_projected_prefill_time_weight
+                                : FLAGS_prefill_time_route_weight))
+              : (FLAGS_enable_prefill_time_route_signal
+                     ? static_cast<double>(candidate.prefill_time) *
+                           FLAGS_prefill_time_route_weight
+                     : 0.0));
+      if (candidate.is_affine) {
+        if (request_is_long) {
+          candidate.affinity_bonus_v0_2 =
+              FLAGS_hybrid_prefill_dynamic_long_affinity_gain_enabled
+                  ? candidate.long_affinity_base_bonus
+                  : FLAGS_hybrid_prefill_long_affinity_bonus;
+        } else {
+          candidate.affinity_bonus_v0_2 =
+              FLAGS_hybrid_prefill_short_affinity_bonus;
+        }
+      }
+      candidate.score_v0_2 = candidate.affinity_bonus_v0_2 +
+                             candidate.rescue_bonus -
+                             candidate.long_short_pool_busy_surcharge -
+                             candidate.long_short_pool_affine_gap_penalty -
+                             candidate.long_affine_busy_penalty -
+                             candidate.request_penalty -
+                             candidate.waiting_penalty -
+                             candidate.token_penalty_v0_2 -
+                             candidate.prefill_time_penalty_v0_2;
+
+      candidate.v0_3_long_request_scale = v0_3_long_request_scale;
+      candidate.v0_3_short_request_scale = v0_3_short_request_scale;
+      candidate.request_token_cost_multiplier_v0_3 =
+          1.0 + candidate.v0_3_long_request_scale *
+                    (FLAGS_long_request_token_cost_multiplier - 1.0);
+      if (use_v0_3a_scoring || use_v0_3b_scoring || use_v0_3c_scoring) {
+        // v0_3a keeps the proven hard affinity prior from v0_2 and only swaps
+        // in projected-cost penalties, so we can isolate whether soft affinity
+        // itself caused gray-band regressions.
+        candidate.affinity_bonus_v0_3 = candidate.affinity_bonus_v0_2;
+      } else if (short_filtered_instances.empty() &&
+                 long_filtered_instances.empty()) {
+        candidate.affinity_bonus_v0_3 =
+            candidate.v0_3_short_request_scale *
+                FLAGS_hybrid_prefill_short_affinity_bonus +
+            candidate.v0_3_long_request_scale *
+                FLAGS_hybrid_prefill_long_affinity_bonus;
+      } else {
+        candidate.affinity_bonus_v0_3 =
+            (candidate.is_short_affine
+                 ? candidate.v0_3_short_request_scale *
+                       FLAGS_hybrid_prefill_short_affinity_bonus
+                 : 0.0) +
+            (candidate.is_long_affine
+                 ? candidate.v0_3_long_request_scale *
+                       FLAGS_hybrid_prefill_long_affinity_bonus
+                 : 0.0);
+      }
+      candidate.token_penalty_v0_3 =
+          static_cast<double>(candidate.projected_prefill_tokens) *
+          FLAGS_hybrid_prefill_token_num_weight *
+          candidate.request_token_cost_multiplier_v0_3;
+      if (use_v0_3b_scoring && request_is_long &&
+          candidate.v0_3_long_request_scale > 0.0 &&
+          candidate.v0_3_long_request_scale < 1.0) {
+        candidate.token_penalty_v0_3 *=
+            FLAGS_hybrid_prefill_v0_3b_boundary_long_projected_token_penalty_scale;
+      }
+      const bool boundary_long_request =
+          request_is_long && candidate.v0_3_long_request_scale > 0.0 &&
+          candidate.v0_3_long_request_scale < 1.0;
+      const bool boundary_long_escape_allowed =
+          use_v0_3c_scoring && boundary_long_request && !candidate.is_affine &&
+          has_affine_candidates && rescue_load_advantaged &&
+          pool_min_combined_load_gap >=
+              FLAGS_hybrid_prefill_v0_3c_boundary_long_escape_load_gap &&
+          affine_pool_min_combined_load >=
+              static_cast<uint64_t>(
+                  FLAGS_hybrid_prefill_v0_3c_boundary_long_escape_min_affine_load);
+      if (boundary_long_escape_allowed) {
+        candidate.boundary_long_escape_bonus_v0_3 =
+            FLAGS_hybrid_prefill_v0_3c_boundary_long_escape_bonus;
+      }
+      candidate.prefill_time_penalty_v0_3 =
+          candidate.normalized_projected_prefill_time_penalty +
+          (FLAGS_enable_lane_specific_projected_prefill_time_route_signal
+              ? static_cast<double>(candidate.projected_prefill_time) *
+                    (candidate.is_long_affine
+                         ? FLAGS_hybrid_prefill_long_lane_projected_prefill_time_weight
+                         : (candidate.is_short_affine
+                                ? FLAGS_hybrid_prefill_short_pool_projected_prefill_time_weight
+                                : FLAGS_prefill_time_route_weight))
+              : (FLAGS_enable_prefill_time_route_signal
+                     ? static_cast<double>(candidate.projected_prefill_time) *
+                           FLAGS_prefill_time_route_weight
+                     : 0.0));
+      candidate.score_v0_3 = candidate.affinity_bonus_v0_3 +
+                             candidate.rescue_bonus -
+                             candidate.long_short_pool_busy_surcharge -
+                             candidate.long_short_pool_affine_gap_penalty -
+                             candidate.long_affine_busy_penalty -
+                             candidate.request_penalty -
+                             candidate.waiting_penalty +
+                             candidate.boundary_long_escape_bonus_v0_3 -
+                             candidate.token_penalty_v0_3 -
+                             candidate.prefill_time_penalty_v0_3;
+
+      candidate.score_before_short_long_lane_penalty =
+          use_v0_3_family_scoring ? candidate.score_v0_3 : candidate.score_v0_2;
+      if (candidate.short_long_lane_penalty > 0.0) {
+        candidate.score_v0_2 -= candidate.short_long_lane_penalty;
+        candidate.score_v0_3 -= candidate.short_long_lane_penalty;
+      }
+      candidate.score =
+          use_v0_3_family_scoring ? candidate.score_v0_3 : candidate.score_v0_2;
+      candidate.decode_pressure_route_cost =
+          compute_decode_pressure_route_cost(candidate.projected_prefill_time);
+      candidate.score_before_decode_pressure_route_cost = candidate.score;
+      if (candidate.decode_pressure_route_cost > 0.0) {
+        candidate.score_v0_2 -= candidate.decode_pressure_route_cost;
+        candidate.score_v0_3 -= candidate.decode_pressure_route_cost;
+        candidate.score -= candidate.decode_pressure_route_cost;
+      }
+      if (candidate.short_long_lane_guarded &&
+          FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject) {
+        candidate.score = std::numeric_limits<double>::lowest();
+      }
+      candidate.affinity_bonus =
+          use_v0_3_family_scoring ? candidate.affinity_bonus_v0_3
+                                  : candidate.affinity_bonus_v0_2;
+      candidate.token_penalty =
+          use_v0_3_family_scoring ? candidate.token_penalty_v0_3
+                                  : candidate.token_penalty_v0_2;
+      candidate.prefill_time_penalty =
+          use_v0_3_family_scoring ? candidate.prefill_time_penalty_v0_3
+                                  : candidate.prefill_time_penalty_v0_2;
+      return candidate;
+    };
+
+    auto format_hybrid_candidate =
+        [&](const std::string& prefill_instance,
+            const HybridCandidateScore& candidate_score) -> std::string {
+      std::ostringstream oss;
+      oss << prefill_instance << "{"
+          << "score=" << candidate_score.score
+          << ",score_v0_2=" << candidate_score.score_v0_2
+          << ",score_v0_3=" << candidate_score.score_v0_3
+          << ",affine=" << candidate_score.is_affine
+          << ",short_affine=" << candidate_score.is_short_affine
+          << ",long_affine=" << candidate_score.is_long_affine
+          << ",short_to_long_lane=" << candidate_score.is_short_to_long_lane
+          << ",long_affine_busy_guarded="
+          << candidate_score.long_affine_busy_admission_guarded
+          << ",long_affine_busy_penalty="
+          << candidate_score.long_affine_busy_penalty
+          << ",long_short_pool_busy_surcharge_guarded="
+          << candidate_score.long_short_pool_busy_surcharge_guarded
+          << ",long_short_pool_busy_surcharge="
+          << candidate_score.long_short_pool_busy_surcharge
+          << ",long_short_pool_continuous_surcharge="
+          << candidate_score.long_short_pool_continuous_surcharge_enabled
+          << ",long_short_pool_affine_gap_penalty_guarded="
+          << candidate_score.long_short_pool_affine_gap_penalty_guarded
+          << ",long_short_pool_affine_gap_penalty="
+          << candidate_score.long_short_pool_affine_gap_penalty
+          << ",short_long_guarded=" << candidate_score.short_long_lane_guarded
+          << ",short_long_guard_reason="
+          << candidate_score.short_long_lane_guard_reason
+          << ",prefill_time=" << candidate_score.prefill_time
+          << ",predicted_request_ttft="
+          << candidate_score.predicted_request_ttft
+          << ",projected_prefill_time="
+          << candidate_score.projected_prefill_time
+          << ",active=" << candidate_score.active_requests
+          << ",waiting=" << candidate_score.waiting_requests
+          << ",combined=" << candidate_score.combined_load
+          << ",prefill_tokens=" << candidate_score.current_prefill_tokens
+          << ",projected_prefill_tokens="
+          << candidate_score.projected_prefill_tokens
+          << ",aff_bonus=" << candidate_score.affinity_bonus
+          << ",aff_bonus_v0_2=" << candidate_score.affinity_bonus_v0_2
+          << ",aff_bonus_v0_3=" << candidate_score.affinity_bonus_v0_3
+          << ",long_aff_base_bonus="
+          << candidate_score.long_affinity_base_bonus
+          << ",dynamic_long_aff_bonus="
+          << candidate_score.dynamic_long_affinity_bonus
+          << ",effective_long_aff_bonus="
+          << candidate_score.effective_long_affinity_bonus
+          << ",dynamic_load_gain=" << candidate_score.dynamic_load_gain
+          << ",dynamic_time_gain=" << candidate_score.dynamic_time_gain
+          << ",rescue_bonus=" << candidate_score.rescue_bonus
+          << ",short_long_lane_penalty="
+          << candidate_score.short_long_lane_penalty
+          << ",score_before_short_long_lane_penalty="
+          << candidate_score.score_before_short_long_lane_penalty
+          << ",decode_pressure_route_cost="
+          << candidate_score.decode_pressure_route_cost
+          << ",score_before_decode_pressure_route_cost="
+          << candidate_score.score_before_decode_pressure_route_cost
+          << ",boundary_long_escape_bonus="
+          << candidate_score.boundary_long_escape_bonus_v0_3
+          << ",req_pen=" << candidate_score.request_penalty
+          << ",wait_pen=" << candidate_score.waiting_penalty
+          << ",token_pen=" << candidate_score.token_penalty
+          << ",token_pen_v0_2=" << candidate_score.token_penalty_v0_2
+          << ",token_pen_v0_3=" << candidate_score.token_penalty_v0_3
+          << ",prefill_pen=" << candidate_score.prefill_time_penalty
+          << ",prefill_pen_v0_2=" << candidate_score.prefill_time_penalty_v0_2
+          << ",prefill_pen_v0_3=" << candidate_score.prefill_time_penalty_v0_3
+          << ",normalized_projected_prefill_pen="
+          << candidate_score.normalized_projected_prefill_time_penalty
+          << ",dynamic_long_req_token_cost_load_gain="
+          << dynamic_long_request_token_cost_load_gain
+          << ",dynamic_long_req_token_cost_time_gain="
+          << dynamic_long_request_token_cost_time_gain
+          << ",dynamic_long_req_token_cost_gap_gain="
+          << dynamic_long_request_token_cost_gap_gain
+          << ",dynamic_long_req_token_cost_mult="
+          << dynamic_long_request_token_cost_multiplier
+          << ",token_cost_mult_v0_2="
+          << candidate_score.request_token_cost_multiplier_v0_2
+          << ",token_cost_mult_v0_3="
+          << candidate_score.request_token_cost_multiplier_v0_3
+          << ",v0_3_short_scale="
+          << candidate_score.v0_3_short_request_scale
+          << ",v0_3_long_scale="
+          << candidate_score.v0_3_long_request_scale
+          << "}";
+      return oss.str();
+    };
+
+    auto route_trace_candidate_to_json =
+        [&](const std::string& prefill_instance,
+            const HybridCandidateScore& candidate_score) -> nlohmann::json {
+      return nlohmann::json{
+          {"instance", prefill_instance},
+          {"score", candidate_score.score},
+          {"score_v0_2", candidate_score.score_v0_2},
+          {"score_v0_3", candidate_score.score_v0_3},
+          {"is_affine", candidate_score.is_affine},
+          {"is_short_affine", candidate_score.is_short_affine},
+          {"is_long_affine", candidate_score.is_long_affine},
+          {"is_short_to_long_lane", candidate_score.is_short_to_long_lane},
+          {"short_long_lane_guarded",
+           candidate_score.short_long_lane_guarded},
+          {"long_affine_busy_admission_guarded",
+           candidate_score.long_affine_busy_admission_guarded},
+          {"long_affine_busy_penalty",
+           candidate_score.long_affine_busy_penalty},
+          {"long_short_pool_busy_surcharge_guarded",
+           candidate_score.long_short_pool_busy_surcharge_guarded},
+          {"long_short_pool_busy_surcharge",
+           candidate_score.long_short_pool_busy_surcharge},
+          {"long_short_pool_continuous_surcharge_enabled",
+           candidate_score.long_short_pool_continuous_surcharge_enabled},
+          {"long_short_pool_affine_gap_penalty_guarded",
+           candidate_score.long_short_pool_affine_gap_penalty_guarded},
+          {"long_short_pool_affine_gap_penalty",
+           candidate_score.long_short_pool_affine_gap_penalty},
+          {"short_long_lane_guard_reason",
+           candidate_score.short_long_lane_guard_reason},
+          {"consecutive_borrow_cap_guard",
+           candidate_score.consecutive_borrow_cap_guard},
+          {"prefill_time_ms", candidate_score.prefill_time},
+          {"predicted_request_ttft_ms",
+           candidate_score.predicted_request_ttft},
+          {"projected_prefill_time_ms",
+           candidate_score.projected_prefill_time},
+          {"active_requests", candidate_score.active_requests},
+          {"waiting_requests", candidate_score.waiting_requests},
+          {"combined_load", candidate_score.combined_load},
+          {"current_prefill_tokens",
+           candidate_score.current_prefill_tokens},
+          {"projected_prefill_tokens",
+           candidate_score.projected_prefill_tokens},
+          {"affinity_bonus", candidate_score.affinity_bonus},
+          {"affinity_bonus_v0_2", candidate_score.affinity_bonus_v0_2},
+          {"affinity_bonus_v0_3", candidate_score.affinity_bonus_v0_3},
+          {"long_affinity_base_bonus",
+           candidate_score.long_affinity_base_bonus},
+          {"dynamic_long_affinity_bonus",
+           candidate_score.dynamic_long_affinity_bonus},
+          {"effective_long_affinity_bonus",
+           candidate_score.effective_long_affinity_bonus},
+          {"dynamic_load_gain", candidate_score.dynamic_load_gain},
+          {"dynamic_time_gain", candidate_score.dynamic_time_gain},
+          {"rescue_bonus", candidate_score.rescue_bonus},
+          {"short_long_lane_penalty",
+           candidate_score.short_long_lane_penalty},
+          {"score_before_short_long_lane_penalty",
+           candidate_score.score_before_short_long_lane_penalty},
+          {"decode_pressure_route_cost",
+           candidate_score.decode_pressure_route_cost},
+          {"score_before_decode_pressure_route_cost",
+           candidate_score.score_before_decode_pressure_route_cost},
+          {"boundary_long_escape_bonus_v0_3",
+           candidate_score.boundary_long_escape_bonus_v0_3},
+          {"request_penalty", candidate_score.request_penalty},
+          {"waiting_penalty", candidate_score.waiting_penalty},
+          {"token_penalty", candidate_score.token_penalty},
+          {"token_penalty_v0_2", candidate_score.token_penalty_v0_2},
+          {"token_penalty_v0_3", candidate_score.token_penalty_v0_3},
+          {"prefill_time_penalty", candidate_score.prefill_time_penalty},
+          {"prefill_time_penalty_v0_2",
+           candidate_score.prefill_time_penalty_v0_2},
+          {"prefill_time_penalty_v0_3",
+           candidate_score.prefill_time_penalty_v0_3},
+          {"normalized_projected_prefill_time_penalty",
+           candidate_score.normalized_projected_prefill_time_penalty},
+          {"dynamic_long_request_token_cost_load_gain",
+           dynamic_long_request_token_cost_load_gain},
+          {"dynamic_long_request_token_cost_time_gain",
+           dynamic_long_request_token_cost_time_gain},
+          {"dynamic_long_request_token_cost_gap_gain",
+           dynamic_long_request_token_cost_gap_gain},
+          {"dynamic_long_request_token_cost_multiplier",
+           dynamic_long_request_token_cost_multiplier},
+          {"request_token_cost_multiplier_v0_2",
+           candidate_score.request_token_cost_multiplier_v0_2},
+          {"request_token_cost_multiplier_v0_3",
+           candidate_score.request_token_cost_multiplier_v0_3},
+          {"v0_3_short_request_scale",
+           candidate_score.v0_3_short_request_scale},
+          {"v0_3_long_request_scale",
+           candidate_score.v0_3_long_request_scale}};
+    };
+
+    std::vector<std::string> hybrid_best_candidates;
+    HybridCandidateScore best_candidate_score;
+    std::vector<std::string> candidate_summaries;
+    std::vector<std::pair<std::string, HybridCandidateScore>> candidate_scores;
+    candidate_scores.reserve(all_prefill_instances.size());
+    for (const auto& prefill_instance : all_prefill_instances) {
+      HybridCandidateScore candidate_score =
+          evaluate_hybrid_candidate(prefill_instance);
+      if (candidate_score.is_affine) {
+        if (!has_affine_pool_projected_prefill_time ||
+            candidate_score.projected_prefill_time <
+                affine_pool_min_projected_prefill_time) {
+          affine_pool_min_projected_prefill_time =
+              candidate_score.projected_prefill_time;
+          has_affine_pool_projected_prefill_time = true;
+        }
+      } else {
+        if (!has_opposite_pool_projected_prefill_time ||
+            candidate_score.projected_prefill_time <
+                opposite_pool_min_projected_prefill_time) {
+          opposite_pool_min_projected_prefill_time =
+              candidate_score.projected_prefill_time;
+          has_opposite_pool_projected_prefill_time = true;
+        }
+      }
+      candidate_scores.emplace_back(prefill_instance, candidate_score);
+    }
+
+    if (request_is_long && has_affine_candidates &&
+        FLAGS_dynamic_long_request_token_cost_enabled) {
+      if (!has_opposite_pool_projected_prefill_time) {
+        dynamic_long_request_token_cost_time_gain = 1.0;
+      } else {
+        const double margin_ms = static_cast<double>(
+            FLAGS_hybrid_prefill_dynamic_projected_prefill_time_margin_ms);
+        if (margin_ms <= 0.0) {
+          dynamic_long_request_token_cost_time_gain =
+              affine_pool_min_projected_prefill_time <=
+                      opposite_pool_min_projected_prefill_time
+                  ? 1.0
+                  : 0.0;
+        } else {
+          dynamic_long_request_token_cost_time_gain = clamp_unit_interval(
+              (static_cast<double>(opposite_pool_min_projected_prefill_time) +
+               margin_ms -
+               static_cast<double>(affine_pool_min_projected_prefill_time)) /
+              margin_ms);
+        }
+      }
+      dynamic_long_request_token_cost_multiplier =
+          FLAGS_long_request_token_cost_multiplier +
+          FLAGS_dynamic_long_request_token_cost_extra_max *
+              dynamic_long_request_token_cost_load_gain *
+              std::max(dynamic_long_request_token_cost_time_gain,
+                       dynamic_long_request_token_cost_gap_gain);
+    }
+
+    for (auto& candidate_entry : candidate_scores) {
+      const std::string& prefill_instance = candidate_entry.first;
+      HybridCandidateScore& candidate_score = candidate_entry.second;
+      if (request_is_long &&
+          FLAGS_hybrid_prefill_dynamic_long_affinity_gain_enabled &&
+          candidate_score.is_affine) {
+        if (!has_opposite_pool_projected_prefill_time) {
+          candidate_score.dynamic_time_gain = 1.0;
+        } else {
+          const double margin_ms = static_cast<double>(
+              FLAGS_hybrid_prefill_dynamic_projected_prefill_time_margin_ms);
+          if (margin_ms <= 0.0) {
+            candidate_score.dynamic_time_gain =
+                candidate_score.projected_prefill_time <=
+                        opposite_pool_min_projected_prefill_time
+                    ? 1.0
+                    : 0.0;
+          } else {
+            candidate_score.dynamic_time_gain = clamp_unit_interval(
+                (static_cast<double>(opposite_pool_min_projected_prefill_time) +
+                 margin_ms -
+                 static_cast<double>(candidate_score.projected_prefill_time)) /
+                margin_ms);
+          }
+        }
+        candidate_score.dynamic_long_affinity_bonus =
+            FLAGS_hybrid_prefill_long_affinity_dynamic_bonus_max *
+            candidate_score.dynamic_load_gain * candidate_score.dynamic_time_gain;
+        candidate_score.effective_long_affinity_bonus =
+            candidate_score.long_affinity_base_bonus +
+            candidate_score.dynamic_long_affinity_bonus;
+        candidate_score.affinity_bonus_v0_2 =
+            candidate_score.effective_long_affinity_bonus;
+        candidate_score.score_v0_2 = candidate_score.affinity_bonus_v0_2 +
+                                     candidate_score.rescue_bonus -
+                                     candidate_score.long_short_pool_busy_surcharge -
+                                     candidate_score.long_short_pool_affine_gap_penalty -
+                                     candidate_score.long_affine_busy_penalty -
+                                     candidate_score.request_penalty -
+                                     candidate_score.waiting_penalty -
+                                     candidate_score.token_penalty_v0_2 -
+                                     candidate_score.prefill_time_penalty_v0_2;
+        if (use_v0_3a_scoring || use_v0_3b_scoring || use_v0_3c_scoring) {
+          candidate_score.affinity_bonus_v0_3 =
+              candidate_score.affinity_bonus_v0_2;
+          candidate_score.score_v0_3 =
+              candidate_score.affinity_bonus_v0_3 +
+              candidate_score.rescue_bonus -
+              candidate_score.long_short_pool_busy_surcharge -
+              candidate_score.long_short_pool_affine_gap_penalty -
+              candidate_score.long_affine_busy_penalty -
+              candidate_score.request_penalty -
+              candidate_score.waiting_penalty +
+              candidate_score.boundary_long_escape_bonus_v0_3 -
+              candidate_score.token_penalty_v0_3 -
+              candidate_score.prefill_time_penalty_v0_3;
+        }
+        candidate_score.score = use_v0_3_family_scoring
+                                    ? candidate_score.score_v0_3
+                                    : candidate_score.score_v0_2;
+        candidate_score.affinity_bonus = use_v0_3_family_scoring
+                                             ? candidate_score.affinity_bonus_v0_3
+                                             : candidate_score.affinity_bonus_v0_2;
+      }
+      if (request_is_long && FLAGS_dynamic_long_request_token_cost_enabled) {
+        candidate_score.request_token_cost_multiplier_v0_2 =
+            dynamic_long_request_token_cost_multiplier;
+        candidate_score.token_penalty_v0_2 =
+            static_cast<double>(candidate_score.current_prefill_tokens) *
+            FLAGS_hybrid_prefill_token_num_weight *
+            candidate_score.request_token_cost_multiplier_v0_2;
+        candidate_score.score_v0_2 = candidate_score.affinity_bonus_v0_2 +
+                                     candidate_score.rescue_bonus -
+                                     candidate_score.long_short_pool_busy_surcharge -
+                                     candidate_score.long_short_pool_affine_gap_penalty -
+                                     candidate_score.long_affine_busy_penalty -
+                                     candidate_score.request_penalty -
+                                     candidate_score.waiting_penalty -
+                                     candidate_score.token_penalty_v0_2 -
+                                     candidate_score.prefill_time_penalty_v0_2;
+        candidate_score.score = use_v0_3_family_scoring
+                                    ? candidate_score.score_v0_3
+                                    : candidate_score.score_v0_2;
+        candidate_score.token_penalty =
+            use_v0_3_family_scoring ? candidate_score.token_penalty_v0_3
+                                    : candidate_score.token_penalty_v0_2;
+      }
+      candidate_summaries.emplace_back(
+          format_hybrid_candidate(prefill_instance, candidate_score));
+      if (route_trace_sampled) {
+        route_trace_candidate_breakdown.emplace_back(
+            route_trace_candidate_to_json(prefill_instance, candidate_score));
+      }
+      if (candidate_score.short_long_lane_guarded &&
+          FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject) {
+        continue;
+      }
+      const bool better_score =
+          candidate_score.score > best_candidate_score.score;
+      const bool same_score =
+          candidate_score.score == best_candidate_score.score;
+      const bool better_combined_load =
+          same_score &&
+          candidate_score.combined_load < best_candidate_score.combined_load;
+      const bool same_combined_load =
+          same_score &&
+          candidate_score.combined_load == best_candidate_score.combined_load;
+      const bool better_waiting =
+          same_combined_load &&
+          candidate_score.waiting_requests <
+              best_candidate_score.waiting_requests;
+      const bool same_waiting =
+          same_combined_load &&
+          candidate_score.waiting_requests ==
+              best_candidate_score.waiting_requests;
+      const bool better_active =
+          same_waiting &&
+          candidate_score.active_requests < best_candidate_score.active_requests;
+      const bool same_active =
+          same_waiting &&
+          candidate_score.active_requests == best_candidate_score.active_requests;
+      const bool better_prefill_time =
+          same_active &&
+          candidate_score.prefill_time < best_candidate_score.prefill_time;
+      const bool same_prefill_time =
+          same_active &&
+          candidate_score.prefill_time == best_candidate_score.prefill_time;
+
+      if (hybrid_best_candidates.empty() || better_score ||
+          better_combined_load || better_waiting || better_active ||
+          better_prefill_time) {
+        hybrid_best_candidates.clear();
+        hybrid_best_candidates.emplace_back(prefill_instance);
+        best_candidate_score = candidate_score;
+      } else if (same_prefill_time) {
+        hybrid_best_candidates.emplace_back(prefill_instance);
+      }
+    }
+
+    if (!hybrid_best_candidates.empty()) {
+      uint64_t* next_tie_break_index =
+          request_is_long ? &next_static_long_prefill_tie_break_index_
+                          : &next_static_short_prefill_tie_break_index_;
+      const uint64_t selected_index =
+          *next_tie_break_index % hybrid_best_candidates.size();
+      selected_prefill_instance = hybrid_best_candidates[selected_index];
+      *next_tie_break_index = selected_index + 1;
+
+      const HybridCandidateScore selected_candidate_score =
+          evaluate_hybrid_candidate(selected_prefill_instance);
+      selected_prefill_score = selected_candidate_score.score;
+      selected_prefill_score_v0_2 = selected_candidate_score.score_v0_2;
+      selected_prefill_score_v0_3 = selected_candidate_score.score_v0_3;
+      selected_affinity_bonus = selected_candidate_score.affinity_bonus;
+      selected_rescue_bonus = selected_candidate_score.rescue_bonus;
+      selected_boundary_long_escape_bonus =
+          selected_candidate_score.boundary_long_escape_bonus_v0_3;
+      selected_long_affine_busy_penalty =
+          selected_candidate_score.long_affine_busy_penalty;
+      selected_long_affine_busy_admission_guarded =
+          selected_candidate_score.long_affine_busy_admission_guarded;
+      selected_long_affinity_base_bonus =
+          selected_candidate_score.long_affinity_base_bonus;
+      selected_dynamic_long_affinity_bonus =
+          selected_candidate_score.dynamic_long_affinity_bonus;
+      selected_effective_long_affinity_bonus =
+          selected_candidate_score.effective_long_affinity_bonus;
+      selected_dynamic_load_gain = selected_candidate_score.dynamic_load_gain;
+      selected_dynamic_time_gain = selected_candidate_score.dynamic_time_gain;
+      selected_request_penalty = selected_candidate_score.request_penalty;
+      selected_waiting_penalty = selected_candidate_score.waiting_penalty;
+      selected_token_penalty = selected_candidate_score.token_penalty;
+      selected_prefill_time_penalty =
+          selected_candidate_score.prefill_time_penalty;
+      selected_combined_load = selected_candidate_score.combined_load;
+      selected_prefill_affine = selected_candidate_score.is_affine;
+      selected_prefill_short_to_long_lane =
+          selected_candidate_score.is_short_to_long_lane;
+      selected_candidate_summary =
+          format_hybrid_candidate(selected_prefill_instance,
+                                  selected_candidate_score);
+    }
+    hybrid_best_candidates_for_trace = hybrid_best_candidates;
+    hybrid_candidate_summaries = absl::StrJoin(candidate_summaries, ";");
+  }
+
+  if (dynamic_cp_shadow_enabled && !opposite_filtered_instances.empty() &&
+      !has_opposite_pool_projected_prefill_time) {
+    for (const auto& prefill_instance : opposite_filtered_instances) {
+      const int64_t projected_prefill_time =
+          request_metrics_[prefill_instance].estimated_prefill_time +
+          get_time_predictor(prefill_instance).predict_ttft(request_tokens);
+      if (!has_opposite_pool_projected_prefill_time ||
+          projected_prefill_time < opposite_pool_min_projected_prefill_time) {
+        opposite_pool_min_projected_prefill_time = projected_prefill_time;
+        has_opposite_pool_projected_prefill_time = true;
+      }
+    }
+  }
+
+  if (dynamic_cp_shadow_enabled) {
+    for (const auto& prefill_instance : all_prefill_instances) {
+      DynamicCpShadowCandidate candidate =
+          evaluate_dynamic_cp_shadow_candidate(prefill_instance);
+      if (route_trace_sampled) {
+        dynamic_cp_shadow_candidate_breakdown.emplace_back(
+            dynamic_cp_shadow_candidate_to_json(candidate));
+      }
+      const bool better_cost =
+          candidate.cost < dynamic_cp_shadow_selected_candidate.cost;
+      const bool same_cost =
+          candidate.cost == dynamic_cp_shadow_selected_candidate.cost;
+      const bool better_combined_load =
+          same_cost &&
+          candidate.combined_load <
+              dynamic_cp_shadow_selected_candidate.combined_load;
+      const bool same_combined_load =
+          same_cost &&
+          candidate.combined_load ==
+              dynamic_cp_shadow_selected_candidate.combined_load;
+      const bool better_waiting =
+          same_combined_load &&
+          candidate.waiting_requests <
+              dynamic_cp_shadow_selected_candidate.waiting_requests;
+      const bool same_waiting =
+          same_combined_load &&
+          candidate.waiting_requests ==
+              dynamic_cp_shadow_selected_candidate.waiting_requests;
+      const bool better_active =
+          same_waiting &&
+          candidate.active_requests <
+              dynamic_cp_shadow_selected_candidate.active_requests;
+      if (!dynamic_cp_shadow_has_selected || better_cost ||
+          better_combined_load || better_waiting || better_active) {
+        dynamic_cp_shadow_selected_candidate = candidate;
+        dynamic_cp_shadow_has_selected = true;
+      }
+    }
+  }
+
+  if (FLAGS_enable_static_prefill_instance_split &&
+      !enable_affinity_routing &&
+      min_prefill_candidates.size() > 1) {
+    std::vector<std::string> final_tie_candidates = min_prefill_candidates;
+    if (FLAGS_enable_static_prefill_load_aware_tie_break) {
+      std::vector<std::string> min_token_candidates;
+      int64_t min_prefill_token_num = std::numeric_limits<int64_t>::max();
+      for (const auto& prefill_instance : min_prefill_candidates) {
+        const int64_t prefill_token_num =
+            get_prefill_token_num(request_metrics_, prefill_instance);
+        if (prefill_token_num < min_prefill_token_num) {
+          min_prefill_token_num = prefill_token_num;
+          min_token_candidates.clear();
+          min_token_candidates.emplace_back(prefill_instance);
+        } else if (prefill_token_num == min_prefill_token_num) {
+          min_token_candidates.emplace_back(prefill_instance);
+        }
+      }
+
+      min_prefill_token_tie_count = min_token_candidates.size();
+      std::vector<std::string> min_waiting_candidates;
+      uint64_t min_waiting_requests_num = std::numeric_limits<uint64_t>::max();
+      for (const auto& prefill_instance : min_token_candidates) {
+        const uint64_t waiting_requests_num =
+            get_waiting_requests_num(load_metrics_, prefill_instance);
+        if (waiting_requests_num < min_waiting_requests_num) {
+          min_waiting_requests_num = waiting_requests_num;
+          min_waiting_candidates.clear();
+          min_waiting_candidates.emplace_back(prefill_instance);
+        } else if (waiting_requests_num == min_waiting_requests_num) {
+          min_waiting_candidates.emplace_back(prefill_instance);
+        }
+      }
+
+      min_prefill_waiting_tie_count = min_waiting_candidates.size();
+      std::vector<std::string> min_request_candidates;
+      int64_t min_prefill_request_num = std::numeric_limits<int64_t>::max();
+      for (const auto& prefill_instance : min_waiting_candidates) {
+        const int64_t prefill_request_num =
+            get_prefill_request_num(request_metrics_, prefill_instance);
+        if (prefill_request_num < min_prefill_request_num) {
+          min_prefill_request_num = prefill_request_num;
+          min_request_candidates.clear();
+          min_request_candidates.emplace_back(prefill_instance);
+        } else if (prefill_request_num == min_prefill_request_num) {
+          min_request_candidates.emplace_back(prefill_instance);
+        }
+      }
+      min_prefill_request_tie_count = min_request_candidates.size();
+      final_tie_candidates = std::move(min_request_candidates);
+    } else {
+      std::vector<std::string> min_request_candidates;
+      int64_t min_prefill_request_num = std::numeric_limits<int64_t>::max();
+      for (const auto& prefill_instance : min_prefill_candidates) {
+        const int64_t prefill_request_num =
+            get_prefill_request_num(request_metrics_, prefill_instance);
+        if (prefill_request_num < min_prefill_request_num) {
+          min_prefill_request_num = prefill_request_num;
+          min_request_candidates.clear();
+          min_request_candidates.emplace_back(prefill_instance);
+        } else if (prefill_request_num == min_prefill_request_num) {
+          min_request_candidates.emplace_back(prefill_instance);
+        }
+      }
+
+      min_prefill_request_tie_count = min_request_candidates.size();
+      std::vector<std::string> min_waiting_candidates;
+      uint64_t min_waiting_requests_num = std::numeric_limits<uint64_t>::max();
+      for (const auto& prefill_instance : min_request_candidates) {
+        const uint64_t waiting_requests_num =
+            get_waiting_requests_num(load_metrics_, prefill_instance);
+        if (waiting_requests_num < min_waiting_requests_num) {
+          min_waiting_requests_num = waiting_requests_num;
+          min_waiting_candidates.clear();
+          min_waiting_candidates.emplace_back(prefill_instance);
+        } else if (waiting_requests_num == min_waiting_requests_num) {
+          min_waiting_candidates.emplace_back(prefill_instance);
+        }
+      }
+      min_prefill_waiting_tie_count = min_waiting_candidates.size();
+      final_tie_candidates = std::move(min_waiting_candidates);
+    }
+
+    uint64_t* next_tie_break_index =
+        request_is_long ? &next_static_long_prefill_tie_break_index_
+                        : &next_static_short_prefill_tie_break_index_;
+    if (!final_tie_candidates.empty()) {
+      const uint64_t selected_index =
+          *next_tie_break_index % final_tie_candidates.size();
+      selected_prefill_instance = final_tie_candidates[selected_index];
+      *next_tie_break_index = selected_index + 1;
+    }
+  }
+
+  if (enable_affinity_routing &&
+      FLAGS_enable_hybrid_prefill_short_long_lane_guard && !request_is_long) {
+    if (selected_prefill_short_to_long_lane) {
+      consecutive_short_long_borrows_after_route =
+          consecutive_short_long_borrow_counter.fetch_add(
+              1, std::memory_order_relaxed) +
+          1;
+    } else {
+      consecutive_short_long_borrow_counter.store(0, std::memory_order_relaxed);
+      consecutive_short_long_borrows_after_route = 0;
+    }
+  }
+
   // select prefill instance
   float tpot_threshold =
       (schedulable_decode_count - 1.0f) / schedulable_decode_count;
@@ -995,13 +3210,346 @@ bool InstanceMgr::select_instance_pair_on_slo(
     request_metrics_[min_decode_instance].estimated_prefill_time +=
         request->estimated_ttft;
   } else {
-    request->routing.prefill_name = min_prefill_instance;
+    request->routing.prefill_name = selected_prefill_instance;
     // update estimated ttft
-    auto& time_predictor = get_time_predictor(min_prefill_instance);
+    auto& time_predictor = get_time_predictor(selected_prefill_instance);
     request->estimated_ttft =
         time_predictor.predict_ttft(request->token_ids.size());
-    request_metrics_[min_prefill_instance].estimated_prefill_time +=
+    request_metrics_[selected_prefill_instance].estimated_prefill_time +=
         request->estimated_ttft;
+  }
+
+  if (dynamic_cp_takeover_enabled && dynamic_cp_shadow_has_selected &&
+      !dynamic_cp_shadow_selected_candidate.prefill_instance.empty() &&
+      dynamic_cp_shadow_selected_candidate.prefill_instance !=
+          request->routing.prefill_name) {
+    const std::string original_prefill_instance = request->routing.prefill_name;
+    request_metrics_[original_prefill_instance].estimated_prefill_time -=
+        request->estimated_ttft;
+    request->routing.prefill_name =
+        dynamic_cp_shadow_selected_candidate.prefill_instance;
+    auto& time_predictor = get_time_predictor(request->routing.prefill_name);
+    request->estimated_ttft =
+        time_predictor.predict_ttft(request->token_ids.size());
+    request_metrics_[request->routing.prefill_name].estimated_prefill_time +=
+        request->estimated_ttft;
+    request->stage_timing_trace.dynamic_cp_takeover_applied_prefill = true;
+  }
+
+  if (dynamic_cp_decode_takeover_enabled && dynamic_cp_shadow_has_selected &&
+      !dynamic_cp_shadow_selected_candidate.decode_instance.empty() &&
+      dynamic_cp_shadow_selected_candidate.decode_instance !=
+          request->routing.decode_name) {
+    request->routing.decode_name =
+        dynamic_cp_shadow_selected_candidate.decode_instance;
+    request->stage_timing_trace.dynamic_cp_takeover_applied_decode = true;
+  }
+
+  request->stage_timing_trace.decode_admission_preferred_decode_matched =
+      !request->stage_timing_trace.decode_admission_preferred_decode_instance
+           .empty() &&
+      request->stage_timing_trace.decode_admission_preferred_decode_instance ==
+          request->routing.decode_name;
+  request->stage_timing_trace.dynamic_cp_shadow_enabled =
+      dynamic_cp_shadow_enabled;
+  request->stage_timing_trace.dynamic_cp_takeover_enabled =
+      dynamic_cp_takeover_enabled;
+  request->stage_timing_trace.dynamic_cp_decode_takeover_enabled =
+      dynamic_cp_decode_takeover_enabled;
+  if (dynamic_cp_shadow_has_selected) {
+    request->stage_timing_trace.dynamic_cp_shadow_selected_prefill_instance =
+        dynamic_cp_shadow_selected_candidate.prefill_instance;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_decode_instance =
+        dynamic_cp_shadow_selected_candidate.decode_instance;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_lane_type =
+        dynamic_cp_shadow_selected_candidate.lane_type;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_cost =
+        dynamic_cp_shadow_selected_candidate.cost;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_prefill_cost =
+        dynamic_cp_shadow_selected_candidate.prefill_cost;
+    request->stage_timing_trace
+        .dynamic_cp_shadow_selected_decode_pressure_cost =
+        dynamic_cp_shadow_selected_candidate.decode_pressure_cost;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_cp_benefit =
+        dynamic_cp_shadow_selected_candidate.cp_benefit;
+    request->stage_timing_trace.dynamic_cp_shadow_selected_interference_cost =
+        dynamic_cp_shadow_selected_candidate.interference_cost;
+    request->stage_timing_trace.dynamic_cp_shadow_would_change_prefill =
+        dynamic_cp_shadow_selected_candidate.prefill_instance !=
+        request->routing.prefill_name;
+    request->stage_timing_trace.dynamic_cp_shadow_would_change_decode =
+        !dynamic_cp_shadow_selected_candidate.decode_instance.empty() &&
+        dynamic_cp_shadow_selected_candidate.decode_instance !=
+            request->routing.decode_name;
+  }
+
+  if (!enable_affinity_routing && route_trace_sampled) {
+    auto candidate_route_to_json = [&](const std::string& prefill_instance) {
+      return nlohmann::json{
+          {"instance", prefill_instance},
+          {"active_requests",
+           get_prefill_request_num(request_metrics_, prefill_instance)},
+          {"waiting_requests",
+           get_waiting_requests_num(load_metrics_, prefill_instance)},
+          {"combined_load",
+           get_prefill_combined_load(
+               request_metrics_, load_metrics_, prefill_instance)},
+          {"current_prefill_tokens",
+           get_prefill_token_num(request_metrics_, prefill_instance)},
+          {"estimated_prefill_time_ms",
+           request_metrics_[prefill_instance].estimated_prefill_time}};
+    };
+    for (const auto& prefill_instance : candidate_prefill_instances) {
+      route_trace_candidate_breakdown.emplace_back(
+          candidate_route_to_json(prefill_instance));
+    }
+  }
+
+  if (route_trace_sampled) {
+    nlohmann::json route_trace_entry{
+        {"timestamp_ms", current_time_ms()},
+        {"route_path", "slo"},
+        {"sample_ordinal", route_trace_sample_ordinal},
+        {"service_request_id", request->service_request_id},
+        {"client_request_id", get_client_request_id(request)},
+        {"request_tokens", request_tokens},
+        {"request_type", request_is_long ? "long" : "short"},
+        {"long_request_threshold_tokens",
+         FLAGS_long_request_threshold_tokens},
+        {"scoring_version", FLAGS_hybrid_prefill_scoring_version},
+        {"hybrid_route_decision_ordinal", hybrid_route_decision_ordinal},
+        {"hybrid_route_elapsed_ms", hybrid_route_elapsed_ms},
+        {"short_long_lane_guard_enabled",
+         FLAGS_enable_hybrid_prefill_short_long_lane_guard},
+        {"short_long_lane_guard_hard_reject",
+         FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject},
+        {"short_long_lane_guard_window_ms",
+         FLAGS_hybrid_prefill_short_long_lane_guard_window_ms},
+        {"short_long_lane_guard_request_count",
+         FLAGS_hybrid_prefill_short_long_lane_guard_request_count},
+        {"short_long_lane_guard_max_long_lane_combined_load",
+         FLAGS_hybrid_prefill_short_long_lane_guard_max_long_lane_combined_load},
+        {"short_long_lane_guard_primary_min_load_threshold",
+         FLAGS_hybrid_prefill_short_long_lane_guard_primary_min_load_threshold},
+        {"short_long_lane_guard_max_prompt_tokens",
+         FLAGS_hybrid_prefill_short_long_lane_guard_max_prompt_tokens},
+        {"short_long_lane_guard_max_consecutive_borrows",
+         FLAGS_hybrid_prefill_short_long_lane_guard_max_consecutive_borrows},
+        {"short_long_lane_penalty",
+         FLAGS_hybrid_prefill_short_long_lane_penalty},
+        {"consecutive_short_long_borrows_before_route",
+         consecutive_short_long_borrows_before_route},
+        {"consecutive_short_long_borrows_after_route",
+         consecutive_short_long_borrows_after_route},
+        {"selected_prefill_short_to_long_lane",
+         selected_prefill_short_to_long_lane},
+        {"selected_prefill_instance",
+         request->routing.prefill_name},
+        {"selected_prefill_instance_by_hybrid_score",
+         selected_prefill_instance},
+        {"selected_prefill_instance_final",
+         request->routing.prefill_name},
+        {"selected_decode_instance", request->routing.decode_name},
+        {"decode_admission_preferred_decode_instance",
+         request->stage_timing_trace
+             .decode_admission_preferred_decode_instance},
+        {"decode_admission_preferred_decode_matched",
+         request->stage_timing_trace
+             .decode_admission_preferred_decode_matched},
+        {"decode_admission_active_requests",
+         request->stage_timing_trace.decode_admission_active_requests},
+        {"decode_admission_waiting_requests",
+         request->stage_timing_trace.decode_admission_waiting_requests},
+        {"decode_admission_estimated_tpot_ms",
+         request->stage_timing_trace.decode_admission_estimated_tpot_ms},
+        {"decode_admission_pressure_tier",
+         request->stage_timing_trace.decode_admission_pressure_tier},
+        {"decode_pressure_soft_signal_only",
+         FLAGS_enable_decode_pressure_soft_signal_only},
+        {"decode_pressure_use_output_work",
+         FLAGS_decode_pressure_admission_use_output_work},
+        {"decode_pressure_route_score_enabled",
+         FLAGS_enable_decode_pressure_route_score},
+        {"decode_pressure_route_score_weight",
+         FLAGS_decode_pressure_route_score_weight},
+        {"dynamic_cp_shadow_enabled", dynamic_cp_shadow_enabled},
+        {"dynamic_cp_takeover_enabled", dynamic_cp_takeover_enabled},
+        {"dynamic_cp_decode_takeover_enabled",
+         dynamic_cp_decode_takeover_enabled},
+        {"dynamic_cp_takeover_applied_prefill",
+         request->stage_timing_trace.dynamic_cp_takeover_applied_prefill},
+        {"dynamic_cp_takeover_applied_decode",
+         request->stage_timing_trace.dynamic_cp_takeover_applied_decode},
+        {"dynamic_cp_shadow_selected_prefill_instance",
+         request->stage_timing_trace
+             .dynamic_cp_shadow_selected_prefill_instance},
+        {"dynamic_cp_shadow_selected_decode_instance",
+         request->stage_timing_trace
+             .dynamic_cp_shadow_selected_decode_instance},
+        {"dynamic_cp_shadow_selected_lane_type",
+         request->stage_timing_trace.dynamic_cp_shadow_selected_lane_type},
+        {"dynamic_cp_shadow_selected_cost",
+         request->stage_timing_trace.dynamic_cp_shadow_selected_cost},
+        {"dynamic_cp_shadow_selected_prefill_cost",
+         request->stage_timing_trace
+             .dynamic_cp_shadow_selected_prefill_cost},
+        {"dynamic_cp_shadow_selected_decode_pressure_cost",
+         request->stage_timing_trace
+             .dynamic_cp_shadow_selected_decode_pressure_cost},
+        {"dynamic_cp_shadow_selected_cp_benefit",
+         request->stage_timing_trace.dynamic_cp_shadow_selected_cp_benefit},
+        {"dynamic_cp_shadow_selected_interference_cost",
+         request->stage_timing_trace
+             .dynamic_cp_shadow_selected_interference_cost},
+        {"dynamic_cp_shadow_would_change_prefill",
+         request->stage_timing_trace.dynamic_cp_shadow_would_change_prefill},
+        {"dynamic_cp_shadow_would_change_decode",
+         request->stage_timing_trace.dynamic_cp_shadow_would_change_decode},
+        {"enable_affinity_routing", enable_affinity_routing},
+        {"static_prefill_split_enabled",
+         FLAGS_enable_static_prefill_instance_split},
+        {"selected_prefill_affine", selected_prefill_affine},
+        {"final_route_used_decode_relief",
+         request->routing.prefill_name != selected_prefill_instance},
+        {"all_candidates", all_prefill_instances},
+        {"affine_candidates", primary_filtered_instances},
+        {"opposite_candidates", opposite_filtered_instances},
+        {"hybrid_best_candidates", hybrid_best_candidates_for_trace},
+        {"affine_candidate_count", primary_filtered_instances.size()},
+        {"opposite_candidate_count", opposite_filtered_instances.size()},
+        {"affine_pool_overloaded", affine_pool_overloaded},
+        {"rescue_token_eligible", rescue_token_eligible},
+        {"affine_pool_min_combined_load",
+         affine_pool_min_combined_load},
+        {"opposite_pool_min_combined_load",
+         opposite_pool_min_combined_load},
+        {"pool_min_combined_load_gap", pool_min_combined_load_gap},
+        {"affine_pool_min_projected_prefill_time_ms",
+         affine_pool_min_projected_prefill_time},
+        {"opposite_pool_min_projected_prefill_time_ms",
+         opposite_pool_min_projected_prefill_time},
+        {"selected_combined_load", selected_combined_load},
+        {"selected_score", selected_prefill_score},
+        {"selected_score_v0_2", selected_prefill_score_v0_2},
+        {"selected_score_v0_3", selected_prefill_score_v0_3},
+        {"selected_affinity_bonus", selected_affinity_bonus},
+        {"selected_rescue_bonus", selected_rescue_bonus},
+        {"selected_boundary_long_escape_bonus",
+         selected_boundary_long_escape_bonus},
+        {"selected_long_affine_busy_penalty",
+         selected_long_affine_busy_penalty},
+        {"selected_long_affine_busy_admission_guarded",
+         selected_long_affine_busy_admission_guarded},
+        {"selected_long_affinity_base_bonus",
+         selected_long_affinity_base_bonus},
+        {"selected_dynamic_long_affinity_bonus",
+         selected_dynamic_long_affinity_bonus},
+        {"selected_effective_long_affinity_bonus",
+         selected_effective_long_affinity_bonus},
+        {"selected_dynamic_load_gain", selected_dynamic_load_gain},
+        {"selected_dynamic_time_gain", selected_dynamic_time_gain},
+        {"selected_request_penalty", selected_request_penalty},
+        {"selected_waiting_penalty", selected_waiting_penalty},
+        {"selected_token_penalty", selected_token_penalty},
+        {"selected_prefill_time_penalty",
+         selected_prefill_time_penalty},
+        {"dynamic_long_request_token_cost_load_gain",
+         dynamic_long_request_token_cost_load_gain},
+        {"dynamic_long_request_token_cost_time_gain",
+         dynamic_long_request_token_cost_time_gain},
+        {"dynamic_long_request_token_cost_gap_gain",
+         dynamic_long_request_token_cost_gap_gain},
+        {"dynamic_long_request_token_cost_multiplier",
+         dynamic_long_request_token_cost_multiplier},
+        {"estimated_ttft_ms", request->estimated_ttft},
+        {"selected_candidate_summary", selected_candidate_summary},
+        {"candidate_breakdown", route_trace_candidate_breakdown},
+        {"dynamic_cp_shadow_candidate_breakdown",
+         dynamic_cp_shadow_candidate_breakdown}};
+    append_route_trace_jsonl(route_trace_entry);
+  }
+
+  if (FLAGS_enable_static_prefill_instance_split) {
+    LOG(INFO) << "StaticSplitRoute tokens=" << request->token_ids.size()
+              << " long=" << request_is_long
+              << " candidates="
+              << absl::StrJoin(candidate_prefill_instances, ",")
+              << " min_prefill_time=" << min_prefill_time
+              << " min_prefill_tie_count=" << min_prefill_candidates.size()
+              << " token_tie_count=" << min_prefill_token_tie_count
+              << " request_tie_count=" << min_prefill_request_tie_count
+              << " waiting_tie_count=" << min_prefill_waiting_tie_count
+              << " soft_fallback=" << static_soft_fallback_triggered
+              << " primary_min_prefill_request_num="
+              << static_primary_min_prefill_request_num
+              << " opposite_min_prefill_request_num="
+              << static_opposite_min_prefill_request_num
+              << " primary_min_prefill_token_num="
+              << static_primary_min_prefill_token_num
+              << " opposite_min_prefill_token_num="
+              << static_opposite_min_prefill_token_num
+              << " selected_prefill=" << request->routing.prefill_name
+              << " selected_decode=" << request->routing.decode_name;
+  }
+  if (enable_affinity_routing) {
+    LOG(INFO) << "HybridAffinityRoute tokens=" << request->token_ids.size()
+              << " long=" << request_is_long
+              << " scoring_version="
+              << FLAGS_hybrid_prefill_scoring_version
+              << " v0_3_soft_long_lower_tokens="
+              << v0_3_soft_long_lower_tokens
+              << " v0_3_soft_long_upper_tokens="
+              << v0_3_soft_long_upper_tokens
+              << " v0_3_short_scale=" << v0_3_short_request_scale
+              << " v0_3_long_scale=" << v0_3_long_request_scale
+              << " all_candidates=" << absl::StrJoin(all_prefill_instances, ",")
+              << " affine_candidates="
+              << absl::StrJoin(primary_filtered_instances, ",")
+              << " opposite_candidates="
+              << absl::StrJoin(opposite_filtered_instances, ",")
+              << " selected_prefill=" << request->routing.prefill_name
+              << " selected_decode=" << request->routing.decode_name
+              << " selected_affine=" << selected_prefill_affine
+              << " short_long_guard_hard_reject="
+              << FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject
+              << " affine_candidate_count="
+              << primary_filtered_instances.size()
+              << " opposite_candidate_count="
+              << opposite_filtered_instances.size()
+              << " affine_pool_overloaded=" << affine_pool_overloaded
+              << " rescue_token_eligible=" << rescue_token_eligible
+              << " affine_pool_min_combined_load="
+              << affine_pool_min_combined_load
+              << " opposite_pool_min_combined_load="
+              << opposite_pool_min_combined_load
+              << " pool_min_combined_load_gap="
+              << pool_min_combined_load_gap
+              << " affine_pool_min_projected_prefill_time="
+              << affine_pool_min_projected_prefill_time
+              << " opposite_pool_min_projected_prefill_time="
+              << opposite_pool_min_projected_prefill_time
+              << " selected_combined_load=" << selected_combined_load
+              << " score=" << selected_prefill_score
+              << " score_v0_2=" << selected_prefill_score_v0_2
+              << " score_v0_3=" << selected_prefill_score_v0_3
+              << " affinity_bonus=" << selected_affinity_bonus
+              << " long_affinity_base_bonus="
+              << selected_long_affinity_base_bonus
+              << " dynamic_long_affinity_bonus="
+              << selected_dynamic_long_affinity_bonus
+              << " effective_long_affinity_bonus="
+              << selected_effective_long_affinity_bonus
+              << " dynamic_load_gain=" << selected_dynamic_load_gain
+              << " dynamic_time_gain=" << selected_dynamic_time_gain
+              << " rescue_bonus=" << selected_rescue_bonus
+              << " boundary_long_escape_bonus="
+              << selected_boundary_long_escape_bonus
+              << " request_penalty=" << selected_request_penalty
+              << " waiting_penalty=" << selected_waiting_penalty
+              << " token_penalty=" << selected_token_penalty
+              << " prefill_time_penalty=" << selected_prefill_time_penalty
+              << " selected_candidate=" << selected_candidate_summary
+              << " candidate_breakdown=" << hybrid_candidate_summaries;
   }
 
   // If there are no decode instances that meet the requirements, switch a
@@ -1150,7 +3698,13 @@ bool InstanceMgr::call_unlink_instance(const std::string& target_rpc_addr,
 
 bool InstanceMgr::register_instance(const std::string& name,
                                     InstanceMetaInfo& info) {
-  info.runtime_state = InstanceRuntimeState::ACTIVE;
+  LOG(INFO) << "Warmtrace register_instance begin name=" << name
+            << ", type=" << static_cast<int>(info.type)
+            << ", rpc_address=" << info.rpc_address
+            << ", incarnation_id=" << info.incarnation_id
+            << ", prefill_index_size=" << prefill_index_.size()
+            << ", decode_index_size=" << decode_index_.size();
+  info.runtime_state = InstanceRuntimeState::REGISTERING;
   info.latest_timestamp = current_time_ms();
   info.name = name;
 
@@ -1178,6 +3732,7 @@ bool InstanceMgr::register_instance(const std::string& name,
       return false;
     }
     cached_channels_[name] = std::move(channel);
+    instances_.insert_or_assign(name, info);
   }
 
   add_instance_resources(name, info);
@@ -1186,21 +3741,48 @@ bool InstanceMgr::register_instance(const std::string& name,
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
     if (!gather_link_operations(info, &link_ops)) {
+      LOG(ERROR) << "Warmtrace gather_link_operations failed name=" << name
+                 << ", type=" << static_cast<int>(info.type);
+      {
+        auto it = instances_.find(name);
+        if (it != instances_.end()) {
+          instances_.erase(it);
+        }
+      }
       remove_instance_resources(name);
       return false;
     }
+    LOG(INFO) << "Warmtrace register_instance gathered link ops name=" << name
+              << ", ops=" << link_ops.size();
   }
 
+  LOG(INFO) << "Warmtrace register_instance run_link_operations name=" << name << ", ops=" << link_ops.size();
   if (!run_link_operations(link_ops)) {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+    auto it = instances_.find(name);
+    if (it != instances_.end()) {
+      instances_.erase(it);
+    }
     remove_instance_resources(name);
     return false;
   }
 
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
-    add_instance_to_index(name, info);
-    instances_.insert(std::make_pair(name, info));
+    auto it = instances_.find(name);
+    if (it == instances_.end()) {
+      LOG(ERROR) << "Instance disappeared during registration, instance_name: "
+                 << name;
+      remove_instance_resources(name);
+      return false;
+    }
+    it->second.runtime_state = InstanceRuntimeState::ACTIVE;
+    add_instance_to_index(name, it->second);
+    LOG(INFO) << "Warmtrace register_instance inserted name=" << name
+              << ", type=" << static_cast<int>(it->second.type)
+              << ", rpc_address=" << it->second.rpc_address
+              << ", prefill_index_size=" << prefill_index_.size()
+              << ", decode_index_size=" << decode_index_.size();
   }
   return true;
 }

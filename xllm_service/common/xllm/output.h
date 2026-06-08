@@ -83,6 +83,16 @@ struct SequenceOutput {
   std::optional<std::vector<LogProb>> logprobs;
 };
 
+struct WarmupDecisionTrace {
+  bool warmup_triggered = false;
+  std::string warmup_state;
+  std::string warmup_reason;
+  int64_t worker_idle_ms = -1;
+  int32_t pending_requests = 0;
+  int32_t running_requests = 0;
+  std::string skip_reason;
+};
+
 struct RequestOutput {
   RequestOutput() = default;
 
@@ -110,6 +120,13 @@ struct RequestOutput {
 
   // whether the prefill stage is finished on prefill_instance.
   bool finished_on_prefill_instance = false;
+
+  // worker-side timing points propagated back to xllm_service.
+  int64_t worker_request_ingress_ts_ms = 0;
+  int64_t worker_first_token_ts_ms = 0;
+  int64_t worker_output_emit_ts_ms = 0;
+
+  WarmupDecisionTrace warmup_decision;
 };
 
 inline std::optional<std::string> to_string(FinishReason reason) {
