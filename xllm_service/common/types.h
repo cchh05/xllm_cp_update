@@ -86,6 +86,7 @@ enum class InstanceRuntimeState : int8_t {
   ACTIVE = 0,
   LEASE_LOST = 1,
   SUSPECT = 2,
+  REGISTERING = 3,
 };
 
 inline const char* runtime_state_name(InstanceRuntimeState state) {
@@ -96,6 +97,8 @@ inline const char* runtime_state_name(InstanceRuntimeState state) {
       return "LEASE_LOST";
     case InstanceRuntimeState::SUSPECT:
       return "SUSPECT";
+    case InstanceRuntimeState::REGISTERING:
+      return "REGISTERING";
     default:
       return "UNKNOWN";
   }

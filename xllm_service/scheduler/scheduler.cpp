@@ -15,6 +15,13 @@ limitations under the License.
 
 #include "scheduler/scheduler.h"
 
+#include <fstream>
+#include <mutex>
+#include <optional>
+
+#include <nlohmann/json.hpp>
+
+#include "common/global_gflags.h"
 #include "common/metrics.h"
 #include "common/utils.h"
 #include "common/xllm/status.h"
@@ -27,9 +34,38 @@ limitations under the License.
 
 namespace {
 constexpr int32_t kHeartbeatInterval = 3;  // in seconds
+constexpr int32_t kServiceLeaseTtlSeconds = 30;  // in seconds
 
 constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
 constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
+
+std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
+std::string ETCD_XSERVICE_KEY_PREFIX = "XLLM:SERVICE:";
+std::string ETCD_MASTER_SERVICE_NAME = "MASTER";
+
+int64_t current_time_ms_for_stage_trace() {
+  return absl::ToUnixMillis(absl::Now());
+}
+
+void append_stage_trace_jsonl(const nlohmann::json& row) {
+  static std::mutex stage_trace_mutex;
+  std::lock_guard<std::mutex> lock(stage_trace_mutex);
+  std::ofstream out(FLAGS_stage_timing_trace_log_path, std::ios::app);
+  if (!out.is_open()) {
+    LOG(ERROR) << "Failed to open stage trace log file: "
+               << FLAGS_stage_timing_trace_log_path;
+    return;
+  }
+  out << row.dump() << "\n";
+}
+
+std::optional<int64_t> diff_ms_if_valid(const int64_t end_ts_ms,
+                                        const int64_t start_ts_ms) {
+  if (end_ts_ms <= 0 || start_ts_ms <= 0 || end_ts_ms < start_ts_ms) {
+    return std::nullopt;
+  }
+  return end_ts_ms - start_ts_ms;
+}
 }  // namespace
 
 namespace xllm_service {
@@ -73,7 +109,7 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 
   if (!etcd_client_->get(ETCD_MASTER_SERVICE_KEY, nullptr)) {
     is_master_service_ = etcd_client_->set(
-        ETCD_MASTER_SERVICE_KEY, options_.service_name(), kHeartbeatInterval);
+        ETCD_MASTER_SERVICE_KEY, options_.service_name(), kServiceLeaseTtlSeconds);
     LOG(INFO) << "Set current service as master!";
   }
 
@@ -134,10 +170,17 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     }
   }
 
+  if (!instance_mgr_->wait_for_decode_pressure_admission(request)) {
+    LOG(ERROR) << "Decode pressure admission failed.";
+    return false;
+  }
+
   auto ret = lb_policy_->select_instances_pair(request);
   if (!ret) {
     return false;
   }
+  request->stage_timing_trace.route_decision_ts_ms =
+      current_time_ms_for_stage_trace();
 
   if (!instance_mgr_->bind_request_instance_incarnations(request)) {
     LOG(ERROR) << "Failed to bind request to instance incarnation ids. "
@@ -174,7 +217,7 @@ bool Scheduler::register_current_service() {
       ETCD_XSERVICE_KEY_PREFIX + options_.service_name();
 
   if (etcd_client_->set(
-          service_key, options_.service_name(), kHeartbeatInterval)) {
+          service_key, options_.service_name(), kServiceLeaseTtlSeconds)) {
     return true;
   }
 
@@ -191,7 +234,13 @@ bool Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   }
   if (!instance_mgr_->record_instance_heartbeat(req->name(),
                                                 req->incarnation_id())) {
-    return false;
+    if (!instance_mgr_->recover_instance_from_etcd(req->name(), req->incarnation_id())) {
+      return false;
+    }
+    if (!instance_mgr_->record_instance_heartbeat(req->name(),
+                                                  req->incarnation_id())) {
+      return false;
+    }
   }
   global_kvcache_mgr_->record_updated_kvcaches(req->name(), req->cache_event());
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
@@ -207,7 +256,7 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
 
   if (etcd_client_->set(ETCD_MASTER_SERVICE_KEY,
                         options_.service_name(),
-                        kHeartbeatInterval)) {
+                        kServiceLeaseTtlSeconds)) {
     is_master_service_ = true;
 
     heartbeat_thread_ = std::make_unique<std::thread>(
@@ -514,11 +563,146 @@ void Scheduler::finish_request(const std::string& service_request_id,
   }
 
   if (request != nullptr) {
+    request->stage_timing_trace.finish_ts_ms = current_time_ms_for_stage_trace();
     if (error) {
       instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
     } else {
       instance_mgr_->update_request_metrics(request,
                                             RequestAction::FINISH_DECODE);
+    }
+
+    if (FLAGS_enable_stage_timing_trace &&
+        !request->client_request_id.empty()) {
+      const auto& t = request->stage_timing_trace;
+      nlohmann::json row{
+          {"route_path",
+           options_.load_balance_policy() == "SLO_AWARE" ? "slo" : "rr"},
+          {"client_request_id", request->client_request_id},
+          {"service_request_id", request->service_request_id},
+          {"request_tokens", request->token_ids.size()},
+          {"request_type",
+           request->token_ids.size() >=
+                   static_cast<size_t>(std::max<int32_t>(
+                       0, FLAGS_long_request_threshold_tokens))
+               ? "long"
+               : "short"},
+          {"selected_prefill_instance", request->routing.prefill_name},
+          {"selected_decode_instance", request->routing.decode_name},
+          {"error", error},
+          {"ingress_ts_ms", t.ingress_ts_ms},
+          {"route_decision_ts_ms", t.route_decision_ts_ms},
+          {"prefill_dispatch_ts_ms", t.prefill_dispatch_ts_ms},
+          {"first_prefill_callback_ts_ms", t.first_prefill_callback_ts_ms},
+          {"first_decode_callback_ts_ms", t.first_decode_callback_ts_ms},
+          {"finish_ts_ms", t.finish_ts_ms},
+          {"worker_prefill_ingress_ts_ms", t.worker_prefill_ingress_ts_ms},
+          {"worker_prefill_first_token_ts_ms",
+           t.worker_prefill_first_token_ts_ms},
+          {"worker_prefill_output_emit_ts_ms",
+           t.worker_prefill_output_emit_ts_ms},
+          {"worker_decode_ingress_ts_ms", t.worker_decode_ingress_ts_ms},
+          {"worker_decode_first_token_ts_ms",
+           t.worker_decode_first_token_ts_ms},
+          {"worker_decode_output_emit_ts_ms",
+           t.worker_decode_output_emit_ts_ms},
+          {"decode_admission_wait_ms", t.decode_admission_wait_ms},
+          {"decode_admission_attempts", t.decode_admission_attempts},
+          {"decode_admission_active_requests",
+           t.decode_admission_active_requests},
+          {"decode_admission_waiting_requests",
+           t.decode_admission_waiting_requests},
+          {"decode_admission_estimated_tpot_ms",
+           t.decode_admission_estimated_tpot_ms},
+          {"decode_admission_pressure_tier",
+           t.decode_admission_pressure_tier},
+          {"decode_admission_preferred_decode_instance",
+           t.decode_admission_preferred_decode_instance},
+          {"decode_admission_preferred_decode_matched",
+           t.decode_admission_preferred_decode_matched},
+          {"dynamic_cp_shadow_enabled", t.dynamic_cp_shadow_enabled},
+          {"dynamic_cp_takeover_enabled", t.dynamic_cp_takeover_enabled},
+          {"dynamic_cp_decode_takeover_enabled",
+           t.dynamic_cp_decode_takeover_enabled},
+          {"dynamic_cp_takeover_applied_prefill",
+           t.dynamic_cp_takeover_applied_prefill},
+          {"dynamic_cp_takeover_applied_decode",
+           t.dynamic_cp_takeover_applied_decode},
+          {"dynamic_cp_shadow_selected_prefill_instance",
+           t.dynamic_cp_shadow_selected_prefill_instance},
+          {"dynamic_cp_shadow_selected_decode_instance",
+           t.dynamic_cp_shadow_selected_decode_instance},
+          {"dynamic_cp_shadow_selected_lane_type",
+           t.dynamic_cp_shadow_selected_lane_type},
+          {"dynamic_cp_shadow_selected_cost",
+           t.dynamic_cp_shadow_selected_cost},
+          {"dynamic_cp_shadow_selected_prefill_cost",
+           t.dynamic_cp_shadow_selected_prefill_cost},
+          {"dynamic_cp_shadow_selected_decode_pressure_cost",
+           t.dynamic_cp_shadow_selected_decode_pressure_cost},
+          {"dynamic_cp_shadow_selected_cp_benefit",
+           t.dynamic_cp_shadow_selected_cp_benefit},
+          {"dynamic_cp_shadow_selected_interference_cost",
+           t.dynamic_cp_shadow_selected_interference_cost},
+          {"dynamic_cp_shadow_would_change_prefill",
+           t.dynamic_cp_shadow_would_change_prefill},
+          {"dynamic_cp_shadow_would_change_decode",
+           t.dynamic_cp_shadow_would_change_decode},
+          {"warmup_triggered", t.warmup_triggered},
+          {"warmup_state", t.warmup_state},
+          {"warmup_reason", t.warmup_reason},
+          {"worker_idle_ms", t.worker_idle_ms},
+          {"pending_requests", t.pending_requests},
+          {"running_requests", t.running_requests},
+          {"skip_reason", t.skip_reason}};
+
+      const auto queue_before_prefill_ms =
+          diff_ms_if_valid(t.prefill_dispatch_ts_ms, t.ingress_ts_ms);
+      const auto prefill_compute_or_service_ms =
+          diff_ms_if_valid(t.first_prefill_callback_ts_ms,
+                           t.worker_prefill_ingress_ts_ms > 0
+                               ? t.worker_prefill_ingress_ts_ms
+                               : t.prefill_dispatch_ts_ms);
+      const auto prefill_worker_exec_ms =
+          diff_ms_if_valid(t.worker_prefill_first_token_ts_ms,
+                           t.worker_prefill_ingress_ts_ms);
+      const auto prefill_callback_gap_ms =
+          diff_ms_if_valid(t.first_prefill_callback_ts_ms,
+                           t.worker_prefill_output_emit_ts_ms);
+      const auto transfer_or_comm_gap_ms =
+          diff_ms_if_valid(t.worker_decode_ingress_ts_ms,
+                           t.worker_prefill_output_emit_ts_ms > 0
+                               ? t.worker_prefill_output_emit_ts_ms
+                               : t.first_prefill_callback_ts_ms);
+      const auto decode_start_delay_ms =
+          diff_ms_if_valid(t.first_decode_callback_ts_ms,
+                           t.worker_decode_ingress_ts_ms);
+
+      row["queue_before_prefill_ms"] =
+          queue_before_prefill_ms.has_value()
+              ? nlohmann::json(*queue_before_prefill_ms)
+              : nlohmann::json(nullptr);
+      row["prefill_compute_or_service_ms"] =
+          prefill_compute_or_service_ms.has_value()
+              ? nlohmann::json(*prefill_compute_or_service_ms)
+              : nlohmann::json(nullptr);
+      row["prefill_worker_exec_ms"] =
+          prefill_worker_exec_ms.has_value()
+              ? nlohmann::json(*prefill_worker_exec_ms)
+              : nlohmann::json(nullptr);
+      row["prefill_callback_gap_ms"] =
+          prefill_callback_gap_ms.has_value()
+              ? nlohmann::json(*prefill_callback_gap_ms)
+              : nlohmann::json(nullptr);
+      row["transfer_or_comm_gap_ms"] =
+          transfer_or_comm_gap_ms.has_value()
+              ? nlohmann::json(*transfer_or_comm_gap_ms)
+              : nlohmann::json(nullptr);
+      row["decode_start_delay_ms"] =
+          decode_start_delay_ms.has_value()
+              ? nlohmann::json(*decode_start_delay_ms)
+              : nlohmann::json(nullptr);
+
+      append_stage_trace_jsonl(row);
     }
   }
 
@@ -612,6 +796,46 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
     // no error, update instance request metrics
     update_request_metrics(request, finished_on_prefill_instance);
     update_token_latency_metrics(request, finished_on_prefill_instance);
+
+    const int64_t now_ms = current_time_ms_for_stage_trace();
+    const auto& warmup = request_output.warmup_decision;
+    const bool has_warmup_trace = warmup.warmup_triggered ||
+                                  !warmup.warmup_state.empty() ||
+                                  !warmup.warmup_reason.empty() ||
+                                  warmup.worker_idle_ms >= 0 ||
+                                  warmup.pending_requests != 0 ||
+                                  warmup.running_requests != 0 ||
+                                  !warmup.skip_reason.empty();
+    if (finished_on_prefill_instance || has_warmup_trace) {
+      request->stage_timing_trace.warmup_triggered = warmup.warmup_triggered;
+      request->stage_timing_trace.warmup_state = warmup.warmup_state;
+      request->stage_timing_trace.warmup_reason = warmup.warmup_reason;
+      request->stage_timing_trace.worker_idle_ms = warmup.worker_idle_ms;
+      request->stage_timing_trace.pending_requests = warmup.pending_requests;
+      request->stage_timing_trace.running_requests = warmup.running_requests;
+      request->stage_timing_trace.skip_reason = warmup.skip_reason;
+    }
+    if (finished_on_prefill_instance) {
+      if (request->stage_timing_trace.first_prefill_callback_ts_ms == 0) {
+        request->stage_timing_trace.first_prefill_callback_ts_ms = now_ms;
+        request->stage_timing_trace.worker_prefill_ingress_ts_ms =
+            request_output.worker_request_ingress_ts_ms;
+        request->stage_timing_trace.worker_prefill_first_token_ts_ms =
+            request_output.worker_first_token_ts_ms;
+      }
+      request->stage_timing_trace.worker_prefill_output_emit_ts_ms =
+          request_output.worker_output_emit_ts_ms;
+    } else {
+      if (request->stage_timing_trace.first_decode_callback_ts_ms == 0) {
+        request->stage_timing_trace.first_decode_callback_ts_ms = now_ms;
+        request->stage_timing_trace.worker_decode_ingress_ts_ms =
+            request_output.worker_request_ingress_ts_ms;
+        request->stage_timing_trace.worker_decode_first_token_ts_ms =
+            request_output.worker_first_token_ts_ms;
+      }
+      request->stage_timing_trace.worker_decode_output_emit_ts_ms =
+          request_output.worker_output_emit_ts_ms;
+    }
   }
 
   size_t req_thread_idx = -1;

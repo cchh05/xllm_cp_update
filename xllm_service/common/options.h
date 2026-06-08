@@ -70,6 +70,7 @@ class Options {
 
   // scheduler options
   PROPERTY(std::string, load_balance_policy);
+  PROPERTY(int32_t, long_request_threshold_tokens) = 4096;
 
   PROPERTY(int32_t, block_size) = 128;
 
