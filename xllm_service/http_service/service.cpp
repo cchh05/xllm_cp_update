@@ -578,7 +578,7 @@ void XllmHttpServiceImpl::AnthropicMessages(
   }
   req_pb->set_request_id(new_anthropic_id());
 
-  auto service_request = generate_request(req_pb, "/v1/messages");
+  auto service_request = generate_request(req_pb, "/v1/messages", cntl);
   service_request->messages = std::move(messages);
   service_request->tools = parse_tools_from_proto(req_pb->tools());
   if (req_pb->has_tool_choice()) {
