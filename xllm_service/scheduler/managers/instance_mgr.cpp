@@ -44,6 +44,7 @@ limitations under the License.
 #include "common/xllm/output.h"
 #include "common/xllm/status.h"
 #include "disagg_pd.pb.h"
+#include "scheduler/managers/pool_elastic_stats.h"
 #include "scheduler/scheduler.h"
 
 namespace {
@@ -262,8 +263,13 @@ bool is_instance_schedulable(const xllm_service::InstanceMetaInfo& info) {
   // LEASE_LOST instances can still be reused while heartbeats continue.
   // REGISTERING instances are visible for heartbeats/recovery, but must not be
   // selected until their registration/link phase finishes.
+  // IDLE / DRAINING instances are kept alive (process, weights, KV cache) but
+  // intentionally excluded from the candidate set by the pool elasticity
+  // controller.
   return info.runtime_state != InstanceRuntimeState::SUSPECT &&
-         info.runtime_state != InstanceRuntimeState::REGISTERING;
+         info.runtime_state != InstanceRuntimeState::REGISTERING &&
+         info.runtime_state != InstanceRuntimeState::IDLE &&
+         info.runtime_state != InstanceRuntimeState::DRAINING;
 }
 
 bool select_next_schedulable_instance(
@@ -309,15 +315,14 @@ std::vector<std::string> get_schedulable_prefill_instances(
     const std::unordered_map<std::string, xllm_service::InstanceMetaInfo>&
         instances,
     const std::vector<std::string>& prefill_index,
-    bool has_unschedulable_instances) {
+    bool /*has_unschedulable_instances*/) {
+  // Pool-elastic correctness: we must always go through is_instance_schedulable
+  // so IDLE / DRAINING / SUSPECT / REGISTERING are uniformly excluded. A prior
+  // fast-path that skipped the predicate when suspect_instances_ was empty
+  // silently let IDLE instances back into candidate sets and broke Line 1.
   std::vector<std::string> result;
   result.reserve(prefill_index.size());
   for (const auto& name : prefill_index) {
-    if (!has_unschedulable_instances) {
-      result.emplace_back(name);
-      continue;
-    }
-
     auto it = instances.find(name);
     if (it == instances.end() || !is_instance_schedulable(it->second)) {
       continue;
@@ -681,6 +686,8 @@ bool InstanceMgr::get_next_instance_pair(const std::shared_ptr<Request>& request
           0, options_.long_request_threshold_tokens()));
   const int32_t request_tokens =
       static_cast<int32_t>(request->token_ids.size());
+  PoolElasticStats::instance().record_request(request_is_long,
+                                              current_time_ms());
   uint64_t route_trace_sample_ordinal = 0;
   const bool route_trace_sampled =
       should_sample_route_trace(request_is_long, &route_trace_sample_ordinal);
@@ -782,6 +789,13 @@ bool InstanceMgr::get_next_instance_pair(const std::shared_ptr<Request>& request
         {"long_candidates", long_filtered_instances},
         {"affine_candidates", affine_candidates},
         {"selected_prefill_affine", selected_prefill_affine},
+        {"pool_long_ratio_30s",
+         PoolElasticStats::instance().compute_long_ratio(
+             FLAGS_pool_elastic_window_s, current_time_ms())},
+        {"pool_active_set", snapshot_active_prefill_instances_locked()},
+        {"pool_state_change_event",
+         build_pool_state_change_event_json(
+             FLAGS_pool_elastic_window_s * 1000)},
         {"candidate_breakdown", candidate_breakdown}};
     append_route_trace_jsonl(route_trace_entry);
   }
@@ -1495,6 +1509,110 @@ void InstanceMgr::update_latency_metrics(
                      latency_metrics.recent_max_tbt()));
 }
 
+void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
+  if (FLAGS_pool_elastic_idle_default_instances.empty()) return;
+
+  static const std::vector<std::string> elastic_selectors =
+      parse_instance_selectors(FLAGS_pool_elastic_idle_default_instances);
+  if (elastic_selectors.empty()) return;
+
+  const double long_ratio = PoolElasticStats::instance().compute_long_ratio(
+      FLAGS_pool_elastic_window_s, now_ms);
+  const uint64_t total_in_window = PoolElasticStats::instance().total_in_window(
+      FLAGS_pool_elastic_window_s, now_ms);
+  if (total_in_window == 0) return;
+
+  std::vector<PoolElasticTransition> transitions;
+  std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+  for (auto& [inst_name, info] : instances_) {
+    if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
+      continue;
+    bool is_elastic = false;
+    for (const auto& sel : elastic_selectors) {
+      if (instance_matches_selector(inst_name, sel)) {
+        is_elastic = true;
+        break;
+      }
+    }
+    if (!is_elastic) continue;
+
+    const uint64_t combined_load = get_prefill_combined_load(
+        request_metrics_, load_metrics_, inst_name);
+
+    const InstanceRuntimeState prev_state = info.runtime_state;
+
+    switch (info.runtime_state) {
+      case InstanceRuntimeState::IDLE: {
+        if (long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
+            static_cast<int32_t>(combined_load) >=
+                FLAGS_pool_elastic_activate_min_load) {
+          info.runtime_state = InstanceRuntimeState::ACTIVE;
+          info.draining_since_ms = 0;
+          info.deactivate_condition_since_ms = 0;
+          LOG(INFO) << "Pool elastic state change: " << inst_name
+                    << " IDLE->ACTIVE, long_ratio=" << long_ratio;
+        }
+        break;
+      }
+      case InstanceRuntimeState::ACTIVE: {
+        if (long_ratio < FLAGS_pool_elastic_deactivate_long_ratio) {
+          // Per-instance counter: a single elastic instance "leaving the busy
+          // band" must not reset the timer for any other elastic instance.
+          // Was previously a function-static, which serialized all elastic
+          // instances onto a single timer and made the multi-instance case
+          // unsound.
+          if (info.deactivate_condition_since_ms == 0) {
+            info.deactivate_condition_since_ms = now_ms;
+          }
+          const uint64_t persist_ms =
+              now_ms - info.deactivate_condition_since_ms;
+          if (persist_ms >=
+              static_cast<uint64_t>(FLAGS_pool_elastic_deactivate_persist_s) *
+                  1000) {
+            if (combined_load == 0) {
+              info.runtime_state = InstanceRuntimeState::DRAINING;
+              info.draining_since_ms = now_ms;
+              info.deactivate_condition_since_ms = 0;
+              LOG(INFO) << "Pool elastic state change: " << inst_name
+                        << " ACTIVE->DRAINING, long_ratio=" << long_ratio
+                        << " persist_ms=" << persist_ms;
+            }
+          }
+        } else {
+          info.deactivate_condition_since_ms = 0;
+        }
+        break;
+      }
+      case InstanceRuntimeState::DRAINING: {
+        if (combined_load == 0 ||
+            (now_ms - info.draining_since_ms >
+             static_cast<uint64_t>(FLAGS_pool_elastic_drain_timeout_ms))) {
+          info.runtime_state = InstanceRuntimeState::IDLE;
+          info.draining_since_ms = 0;
+          info.deactivate_condition_since_ms = 0;
+          LOG(INFO) << "Pool elastic state change: " << inst_name
+                    << " DRAINING->IDLE, combined_load=" << combined_load;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    if (info.runtime_state != prev_state) {
+      transitions.push_back({inst_name,
+                             prev_state,
+                             info.runtime_state,
+                             now_ms,
+                             long_ratio,
+                             combined_load});
+    }
+  }
+  if (!transitions.empty()) {
+    publish_pool_elastic_transitions(std::move(transitions));
+  }
+}
+
 void InstanceMgr::reconcile_instance_states() {
   const auto suspect_interval_ms =
       std::max<int64_t>(1, options_.detect_disconnected_instance_interval()) *
@@ -1503,6 +1621,7 @@ void InstanceMgr::reconcile_instance_states() {
       std::max<int64_t>(1, options_.lease_lost_heartbeat_timeout_ms());
   while (!exited_) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
+    tick_pool_elasticity(current_time_ms());
 
     std::vector<std::pair<std::string, std::string>> to_deregister;
 
@@ -1569,12 +1688,61 @@ void InstanceMgr::refresh_instance_registration(const std::string& name,
   // Preserve local scheduling/index state across etcd refreshes.
   const auto instance_index = it->second.instance_index;
   const auto current_type = it->second.current_type;
+  // Pool-elastic correctness: runtime_state, draining_since_ms and the
+  // per-instance deactivate condition timer are runtime-only signals not
+  // reflected in etcd. They MUST survive an etcd refresh so the pool elastic
+  // controller can keep advancing IDLE/ACTIVE/DRAINING. The previous
+  // implementation unconditionally reset runtime_state to ACTIVE on every
+  // refresh, which silently undid every pool elastic decision.
+  const auto runtime_state = it->second.runtime_state;
+  const auto draining_since_ms = it->second.draining_since_ms;
+  const auto deactivate_condition_since_ms =
+      it->second.deactivate_condition_since_ms;
 
   it->second = info;
   it->second.instance_index = instance_index;
   it->second.current_type = current_type;
   it->second.latest_timestamp = current_time_ms();
-  it->second.runtime_state = InstanceRuntimeState::ACTIVE;
+  // For lifecycle transients (REGISTERING/SUSPECT/LEASE_LOST) we re-resolve
+  // the desired initial state, so a recovered instance can re-enter IDLE if
+  // it matches the elastic selector. For IDLE/ACTIVE/DRAINING we keep the
+  // existing runtime decision so the elastic controller is the only writer.
+  if (runtime_state == InstanceRuntimeState::REGISTERING ||
+      runtime_state == InstanceRuntimeState::SUSPECT ||
+      runtime_state == InstanceRuntimeState::LEASE_LOST) {
+    it->second.runtime_state = resolve_initial_runtime_state(name, it->second);
+    it->second.draining_since_ms = 0;
+    it->second.deactivate_condition_since_ms = 0;
+  } else {
+    it->second.runtime_state = runtime_state;
+    it->second.draining_since_ms = draining_since_ms;
+    it->second.deactivate_condition_since_ms = deactivate_condition_since_ms;
+  }
+}
+
+InstanceRuntimeState InstanceMgr::resolve_initial_runtime_state(
+    const std::string& name,
+    const InstanceMetaInfo& info) const {
+  // Decode instances are not part of the elastic pool today.
+  if (info.type == InstanceType::DECODE) {
+    return InstanceRuntimeState::ACTIVE;
+  }
+  if (info.type != InstanceType::DEFAULT &&
+      info.type != InstanceType::PREFILL &&
+      info.type != InstanceType::MIX) {
+    return InstanceRuntimeState::ACTIVE;
+  }
+  if (FLAGS_pool_elastic_idle_default_instances.empty()) {
+    return InstanceRuntimeState::ACTIVE;
+  }
+  const std::vector<std::string> idle_selectors =
+      parse_instance_selectors(FLAGS_pool_elastic_idle_default_instances);
+  for (const auto& selector : idle_selectors) {
+    if (instance_matches_selector(name, selector)) {
+      return InstanceRuntimeState::IDLE;
+    }
+  }
+  return InstanceRuntimeState::ACTIVE;
 }
 
 void InstanceMgr::mark_instance_suspect(const std::string& name,
@@ -1599,6 +1767,60 @@ void InstanceMgr::clear_suspect_instance(const std::string& name,
     return;
   }
   suspect_instances_.erase(it);
+}
+
+void InstanceMgr::publish_pool_elastic_transitions(
+    std::vector<PoolElasticTransition> events) {
+  if (events.empty()) return;
+  std::lock_guard<std::mutex> lock(pool_elastic_events_mutex_);
+  for (auto& e : events) {
+    pool_elastic_events_.emplace_back(std::move(e));
+    while (pool_elastic_events_.size() > kPoolElasticEventsCap) {
+      pool_elastic_events_.pop_front();
+    }
+  }
+}
+
+std::vector<InstanceMgr::PoolElasticTransition>
+InstanceMgr::take_recent_pool_elastic_transitions(size_t max_age_ms) const {
+  std::vector<PoolElasticTransition> out;
+  const uint64_t now_ms = current_time_ms();
+  std::lock_guard<std::mutex> lock(pool_elastic_events_mutex_);
+  out.reserve(pool_elastic_events_.size());
+  for (const auto& e : pool_elastic_events_) {
+    if (max_age_ms == 0 || now_ms - e.ts_ms <= max_age_ms) {
+      out.push_back(e);
+    }
+  }
+  return out;
+}
+
+std::vector<std::string>
+InstanceMgr::snapshot_active_prefill_instances_locked() const {
+  std::vector<std::string> out;
+  out.reserve(prefill_index_.size());
+  for (const auto& name : prefill_index_) {
+    auto it = instances_.find(name);
+    if (it == instances_.end()) continue;
+    if (it->second.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+    out.push_back(name);
+  }
+  return out;
+}
+
+nlohmann::json InstanceMgr::build_pool_state_change_event_json(
+    uint64_t window_ms) const {
+  const auto recent = take_recent_pool_elastic_transitions(window_ms);
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& e : recent) {
+    arr.push_back({{"instance", e.instance_name},
+                   {"from_state", runtime_state_name(e.from_state)},
+                   {"to_state", runtime_state_name(e.to_state)},
+                   {"ts_ms", e.ts_ms},
+                   {"long_ratio", e.long_ratio},
+                   {"combined_load", e.combined_load}});
+  }
+  return arr;
 }
 
 void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
@@ -1690,6 +1912,8 @@ bool InstanceMgr::select_instance_pair_on_slo(
       request->token_ids.size() >=
       static_cast<size_t>(std::max<int32_t>(
           0, options_.long_request_threshold_tokens()));
+  PoolElasticStats::instance().record_request(request_is_long,
+                                              current_time_ms());
   const int32_t request_tokens = static_cast<int32_t>(request->token_ids.size());
   const int64_t decode_work_tokens =
       estimate_decode_work_tokens(request, request_tokens, request_is_long);
@@ -3463,6 +3687,13 @@ bool InstanceMgr::select_instance_pair_on_slo(
          dynamic_long_request_token_cost_multiplier},
         {"estimated_ttft_ms", request->estimated_ttft},
         {"selected_candidate_summary", selected_candidate_summary},
+        {"pool_long_ratio_30s",
+         PoolElasticStats::instance().compute_long_ratio(
+             FLAGS_pool_elastic_window_s, current_time_ms())},
+        {"pool_active_set", snapshot_active_prefill_instances_locked()},
+        {"pool_state_change_event",
+         build_pool_state_change_event_json(
+             FLAGS_pool_elastic_window_s * 1000)},
         {"candidate_breakdown", route_trace_candidate_breakdown},
         {"dynamic_cp_shadow_candidate_breakdown",
          dynamic_cp_shadow_candidate_breakdown}};
@@ -3776,13 +4007,23 @@ bool InstanceMgr::register_instance(const std::string& name,
       remove_instance_resources(name);
       return false;
     }
-    it->second.runtime_state = InstanceRuntimeState::ACTIVE;
+    it->second.runtime_state = resolve_initial_runtime_state(name, it->second);
+    it->second.draining_since_ms = 0;
+    it->second.deactivate_condition_since_ms = 0;
     add_instance_to_index(name, it->second);
     LOG(INFO) << "Warmtrace register_instance inserted name=" << name
               << ", type=" << static_cast<int>(it->second.type)
               << ", rpc_address=" << it->second.rpc_address
+              << ", runtime_state="
+              << runtime_state_name(it->second.runtime_state)
               << ", prefill_index_size=" << prefill_index_.size()
               << ", decode_index_size=" << decode_index_.size();
+
+    if (it->second.runtime_state == InstanceRuntimeState::IDLE) {
+      LOG(INFO) << "Pool elastic init: " << name
+                << " set to IDLE (matches elastic selector list '"
+                << FLAGS_pool_elastic_idle_default_instances << "')";
+    }
   }
   return true;
 }

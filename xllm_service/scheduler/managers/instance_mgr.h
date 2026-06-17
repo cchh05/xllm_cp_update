@@ -17,7 +17,10 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <nlohmann/json.hpp>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -110,6 +113,42 @@ class InstanceMgr final {
                          std::shared_ptr<brpc::Channel>* out_channel);
   bool probe_instance_health(const std::string& instance_name);
   void reconcile_instance_states();
+  void tick_pool_elasticity(uint64_t now_ms);
+
+  // Pool elastic state-change record, surfaced into route_trace via
+  // pool_state_change_event so we can correlate "this request landed
+  // immediately after instance X went IDLE->ACTIVE".
+  struct PoolElasticTransition {
+    std::string instance_name;
+    InstanceRuntimeState from_state;
+    InstanceRuntimeState to_state;
+    uint64_t ts_ms = 0;
+    double long_ratio = 0.0;
+    uint64_t combined_load = 0;
+  };
+  // Append to the recent ring buffer (under cluster_mutex_, called by tick).
+  void publish_pool_elastic_transitions(
+      std::vector<PoolElasticTransition> events);
+  // Snapshot the recent ring buffer; thread-safe.
+  std::vector<PoolElasticTransition> take_recent_pool_elastic_transitions(
+      size_t max_age_ms) const;
+  // Snapshot of the currently ACTIVE prefill set (i.e. what hb scoring is
+  // really considering after the IDLE/DRAINING gate has fired). Caller must
+  // hold cluster_mutex_ in shared mode.
+  std::vector<std::string> snapshot_active_prefill_instances_locked() const;
+  // Surface recent pool elastic transitions into route_trace as a JSON value.
+  // window_ms bounds how far back the trace can look. Returns nlohmann::json
+  // (an array) without depending on header users including the JSON header
+  // beyond what they already do.
+  nlohmann::json build_pool_state_change_event_json(uint64_t window_ms) const;
+
+  // Resolve the initial runtime_state for a freshly registered instance, or
+  // for one that has just exited a lifecycle transient (REGISTERING / SUSPECT
+  // / LEASE_LOST). Pool elastic selectors yield IDLE; everything else yields
+  // ACTIVE. Decode instances are never elastic.
+  InstanceRuntimeState resolve_initial_runtime_state(
+      const std::string& name,
+      const InstanceMetaInfo& info) const;
   void refresh_instance_registration(const std::string& name,
                                      const InstanceMetaInfo& info);
   void mark_instance_suspect(const std::string& name,
@@ -205,6 +244,12 @@ class InstanceMgr final {
   // not own
   // NOTE: need to refactor with scheduler in future
   Scheduler* scheduler_;
+
+  // Pool elastic transition ring buffer. Mutex is leaf-level: never held when
+  // taking cluster_mutex_/metrics_mutex_, so it can be entered from any path.
+  mutable std::mutex pool_elastic_events_mutex_;
+  std::deque<PoolElasticTransition> pool_elastic_events_;
+  static constexpr size_t kPoolElasticEventsCap = 256;
 
   ThreadPool threadpool_;
   std::unique_ptr<std::thread> state_reconcile_thread_;

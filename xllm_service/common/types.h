@@ -87,6 +87,8 @@ enum class InstanceRuntimeState : int8_t {
   LEASE_LOST = 1,
   SUSPECT = 2,
   REGISTERING = 3,
+  IDLE = 4,
+  DRAINING = 5,
 };
 
 inline const char* runtime_state_name(InstanceRuntimeState state) {
@@ -99,6 +101,10 @@ inline const char* runtime_state_name(InstanceRuntimeState state) {
       return "SUSPECT";
     case InstanceRuntimeState::REGISTERING:
       return "REGISTERING";
+    case InstanceRuntimeState::IDLE:
+      return "IDLE";
+    case InstanceRuntimeState::DRAINING:
+      return "DRAINING";
     default:
       return "UNKNOWN";
   }
@@ -219,6 +225,18 @@ struct InstanceMetaInfo {
   // Runtime-only instance state, not persisted to etcd.
   InstanceRuntimeState runtime_state = InstanceRuntimeState::ACTIVE;
 
+  // Runtime-only timestamp recording when the instance entered DRAINING state,
+  // used by the pool elasticity controller to bound drain duration.
+  // 0 means the instance is not currently draining. Not persisted to etcd.
+  uint64_t draining_since_ms = 0;
+
+  // Runtime-only timestamp recording when the per-instance "long_ratio fell
+  // below deactivate threshold" condition first became true. Cleared back to 0
+  // whenever the condition no longer holds. Each elastic instance owns its own
+  // counter so multiple instances cannot interfere with each other's drain
+  // decisions. Not persisted to etcd.
+  uint64_t deactivate_condition_since_ms = 0;
+
   uint64_t instance_index = -1;
 
   // Used to indicate the exact instance type of a MIX type instance currently,
@@ -310,6 +328,8 @@ struct InstanceMetaInfo {
       }
 
       runtime_state = InstanceRuntimeState::ACTIVE;
+      draining_since_ms = 0;
+      deactivate_condition_since_ms = 0;
       set_init_timestamp();
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str

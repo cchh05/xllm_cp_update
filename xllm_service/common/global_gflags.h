@@ -189,3 +189,12 @@ DECLARE_string(tool_call_parser);
 DECLARE_string(reasoning_parser);
 
 DECLARE_int32(readiness_check_interval_s);
+
+// Pool elasticity controller flags.
+DECLARE_string(pool_elastic_idle_default_instances);
+DECLARE_double(pool_elastic_activate_long_ratio);
+DECLARE_int32(pool_elastic_activate_min_load);
+DECLARE_double(pool_elastic_deactivate_long_ratio);
+DECLARE_int32(pool_elastic_deactivate_persist_s);
+DECLARE_int32(pool_elastic_drain_timeout_ms);
+DECLARE_int32(pool_elastic_window_s);

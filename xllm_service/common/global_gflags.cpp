@@ -956,3 +956,34 @@ DEFINE_int32(readiness_check_interval_s,
              "before starting and during runtime of the HTTP service.");
 
 BRPC_VALIDATE_GFLAG(readiness_check_interval_s, brpc::PositiveInteger);
+
+// Pool elasticity controller flags.
+DEFINE_string(pool_elastic_idle_default_instances,
+              "",
+              "Comma-separated instance selectors that start in IDLE state. "
+              "Matches by full name, :port suffix, or bare port number.");
+
+DEFINE_double(pool_elastic_activate_long_ratio,
+              0.30,
+              "Long-request rolling ratio threshold to activate IDLE instances.");
+
+DEFINE_int32(pool_elastic_activate_min_load,
+             1,
+             "Minimum combined load on any ACTIVE long lane before activation.");
+
+DEFINE_double(pool_elastic_deactivate_long_ratio,
+              0.10,
+              "Long-request rolling ratio below which ACTIVE elastic instances "
+              "transition to DRAINING.");
+
+DEFINE_int32(pool_elastic_deactivate_persist_s,
+             60,
+             "Seconds the deactivation condition must persist before drain.");
+
+DEFINE_int32(pool_elastic_drain_timeout_ms,
+             30000,
+             "Maximum drain duration in ms before forcing IDLE.");
+
+DEFINE_int32(pool_elastic_window_s,
+             30,
+             "Rolling window in seconds for long-request ratio computation.");
