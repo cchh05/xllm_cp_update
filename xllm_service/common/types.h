@@ -237,6 +237,12 @@ struct InstanceMetaInfo {
   // decisions. Not persisted to etcd.
   uint64_t deactivate_condition_since_ms = 0;
 
+  // Runtime-only timestamp recording the last IDLE->ACTIVE transition for
+  // this instance. Used by the P2 step-activation cool-down to prevent the
+  // controller from waking the entire IDLE pool in a single tick. Not
+  // persisted to etcd.
+  uint64_t last_activated_ts_ms = 0;
+
   uint64_t instance_index = -1;
 
   // Used to indicate the exact instance type of a MIX type instance currently,
@@ -330,6 +336,7 @@ struct InstanceMetaInfo {
       runtime_state = InstanceRuntimeState::ACTIVE;
       draining_since_ms = 0;
       deactivate_condition_since_ms = 0;
+      last_activated_ts_ms = 0;
       set_init_timestamp();
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str

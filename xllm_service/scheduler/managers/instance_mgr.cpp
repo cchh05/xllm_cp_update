@@ -793,6 +793,9 @@ bool InstanceMgr::get_next_instance_pair(const std::shared_ptr<Request>& request
          PoolElasticStats::instance().compute_long_ratio(
              FLAGS_pool_elastic_window_s, current_time_ms())},
         {"pool_active_set", snapshot_active_prefill_instances_locked()},
+        {"pool_pressure_now", compute_pool_pressure_locked()},
+        {"pool_elastic_use_pressure_signal",
+         FLAGS_pool_elastic_use_pressure_signal},
         {"pool_state_change_event",
          build_pool_state_change_event_json(
              FLAGS_pool_elastic_window_s * 1000)},
@@ -1522,8 +1525,58 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
       FLAGS_pool_elastic_window_s, now_ms);
   if (total_in_window == 0) return;
 
-  std::vector<PoolElasticTransition> transitions;
+  // P2 dual-signal mode: aggregate ACTIVE-pool pressure once per tick, then
+  // fold it into the per-instance state transitions below. When the master
+  // switch is off, pool_pressure stays at 0.0 and every comparison degrades
+  // to the legacy long_ratio-only logic.
+  const bool use_pressure = FLAGS_pool_elastic_use_pressure_signal;
   std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+  const double pool_pressure =
+      use_pressure ? compute_pool_pressure_locked() : 0.0;
+
+  // Step-activation: across the entire tick, allow at most one IDLE->ACTIVE
+  // promotion. The chosen instance is the one that has been IDLE longest
+  // (smallest last_activated_ts_ms; 0 wins). This avoids promoting the entire
+  // IDLE pool in a single tick and gives the controller a chance to observe
+  // how the cluster reacts before promoting more.
+  std::string activation_target;
+  uint64_t activation_target_ts = std::numeric_limits<uint64_t>::max();
+  if (use_pressure) {
+    for (auto& [inst_name, info] : instances_) {
+      if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
+        continue;
+      if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
+      bool is_elastic = false;
+      for (const auto& sel : elastic_selectors) {
+        if (instance_matches_selector(inst_name, sel)) {
+          is_elastic = true;
+          break;
+        }
+      }
+      if (!is_elastic) continue;
+      // Cool-down: don't even consider an instance that was just activated /
+      // most recently demoted within cool_down_s.
+      const uint64_t cool_down_ms = static_cast<uint64_t>(std::max<int32_t>(
+          0, FLAGS_pool_elastic_activation_cool_down_s)) * 1000ULL;
+      if (info.last_activated_ts_ms != 0 &&
+          now_ms - info.last_activated_ts_ms < cool_down_ms) {
+        continue;
+      }
+      // Pressure-driven activation gate.
+      const bool pressure_high =
+          pool_pressure >= FLAGS_pool_elastic_activate_pressure_threshold;
+      const bool long_ratio_high_with_load =
+          long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
+          pool_pressure >= FLAGS_pool_elastic_activate_min_pressure;
+      if (!(pressure_high || long_ratio_high_with_load)) continue;
+      if (info.last_activated_ts_ms < activation_target_ts) {
+        activation_target_ts = info.last_activated_ts_ms;
+        activation_target = inst_name;
+      }
+    }
+  }
+
+  std::vector<PoolElasticTransition> transitions;
   for (auto& [inst_name, info] : instances_) {
     if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
       continue;
@@ -1543,24 +1596,41 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
 
     switch (info.runtime_state) {
       case InstanceRuntimeState::IDLE: {
-        if (long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
-            static_cast<int32_t>(combined_load) >=
-                FLAGS_pool_elastic_activate_min_load) {
+        bool should_activate = false;
+        if (use_pressure) {
+          // Only the single chosen activation_target promotes this tick.
+          should_activate = (inst_name == activation_target);
+        } else {
+          // Legacy path: long_ratio-only.
+          should_activate =
+              long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
+              static_cast<int32_t>(combined_load) >=
+                  FLAGS_pool_elastic_activate_min_load;
+        }
+        if (should_activate) {
           info.runtime_state = InstanceRuntimeState::ACTIVE;
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
+          info.last_activated_ts_ms = now_ms;
           LOG(INFO) << "Pool elastic state change: " << inst_name
-                    << " IDLE->ACTIVE, long_ratio=" << long_ratio;
+                    << " IDLE->ACTIVE, long_ratio=" << long_ratio
+                    << " pool_pressure=" << pool_pressure
+                    << " mode=" << (use_pressure ? "pressure" : "long_ratio");
         }
         break;
       }
       case InstanceRuntimeState::ACTIVE: {
-        if (long_ratio < FLAGS_pool_elastic_deactivate_long_ratio) {
+        bool below_deactivate = false;
+        if (use_pressure) {
+          below_deactivate =
+              pool_pressure < FLAGS_pool_elastic_deactivate_pressure_threshold;
+        } else {
+          below_deactivate =
+              long_ratio < FLAGS_pool_elastic_deactivate_long_ratio;
+        }
+        if (below_deactivate) {
           // Per-instance counter: a single elastic instance "leaving the busy
           // band" must not reset the timer for any other elastic instance.
-          // Was previously a function-static, which serialized all elastic
-          // instances onto a single timer and made the multi-instance case
-          // unsound.
           if (info.deactivate_condition_since_ms == 0) {
             info.deactivate_condition_since_ms = now_ms;
           }
@@ -1575,7 +1645,10 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
               info.deactivate_condition_since_ms = 0;
               LOG(INFO) << "Pool elastic state change: " << inst_name
                         << " ACTIVE->DRAINING, long_ratio=" << long_ratio
-                        << " persist_ms=" << persist_ms;
+                        << " pool_pressure=" << pool_pressure
+                        << " persist_ms=" << persist_ms
+                        << " mode=" << (use_pressure ? "pressure"
+                                                     : "long_ratio");
             }
           }
         } else {
@@ -1591,7 +1664,8 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
           LOG(INFO) << "Pool elastic state change: " << inst_name
-                    << " DRAINING->IDLE, combined_load=" << combined_load;
+                    << " DRAINING->IDLE, combined_load=" << combined_load
+                    << " pool_pressure=" << pool_pressure;
         }
         break;
       }
@@ -1821,6 +1895,52 @@ nlohmann::json InstanceMgr::build_pool_state_change_event_json(
                    {"combined_load", e.combined_load}});
   }
   return arr;
+}
+
+double InstanceMgr::compute_pool_pressure_locked() const {
+  // Aggregator across the ACTIVE prefill / mix set:
+  //   max over instances of:
+  //     load_w * combined_load
+  //   + wait_w * waiting_requests
+  //   + pft_w  * (current_prefill_tokens / pft_baseline_tokens)
+  //
+  // current_prefill_tokens is used as a proxy for projected prefill time:
+  // bigger backlog -> longer head-of-line wait. Using the raw
+  // projected_prefill_time_ms would require running the time predictor here,
+  // which is expensive and only meaningful per-request, not per-instance.
+  const double load_w = FLAGS_pool_elastic_pressure_load_weight;
+  const double wait_w = FLAGS_pool_elastic_pressure_wait_weight;
+  const double pft_w  = FLAGS_pool_elastic_pressure_pft_weight;
+  const int32_t pft_baseline_ms = std::max<int32_t>(
+      1, FLAGS_pool_elastic_pressure_pft_baseline_ms);
+  // Reuse pft_baseline_ms as a token-budget proxy: a baseline of 2000ms
+  // roughly corresponds to ~16k tokens of prefill backlog on this hardware.
+  // Operators tune via the gflag; default keeps the term in [0,1] band.
+  const double pft_baseline_tokens =
+      static_cast<double>(pft_baseline_ms) * 8.0;
+
+  double max_pressure = 0.0;
+  for (const auto& name : prefill_index_) {
+    auto it = instances_.find(name);
+    if (it == instances_.end()) continue;
+    if (it->second.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+
+    const double load = static_cast<double>(
+        get_prefill_combined_load(request_metrics_, load_metrics_, name));
+    const double wait = static_cast<double>(
+        get_waiting_requests_num(load_metrics_, name));
+    const double tokens = static_cast<double>(
+        get_prefill_token_num(request_metrics_, name));
+
+    double pressure = 0.0;
+    if (load_w > 0.0) pressure += load_w * load;
+    if (wait_w > 0.0) pressure += wait_w * wait;
+    if (pft_w > 0.0 && pft_baseline_tokens > 0.0) {
+      pressure += pft_w * (tokens / pft_baseline_tokens);
+    }
+    if (pressure > max_pressure) max_pressure = pressure;
+  }
+  return max_pressure;
 }
 
 void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
@@ -3691,6 +3811,9 @@ bool InstanceMgr::select_instance_pair_on_slo(
          PoolElasticStats::instance().compute_long_ratio(
              FLAGS_pool_elastic_window_s, current_time_ms())},
         {"pool_active_set", snapshot_active_prefill_instances_locked()},
+        {"pool_pressure_now", compute_pool_pressure_locked()},
+        {"pool_elastic_use_pressure_signal",
+         FLAGS_pool_elastic_use_pressure_signal},
         {"pool_state_change_event",
          build_pool_state_change_event_json(
              FLAGS_pool_elastic_window_s * 1000)},

@@ -198,3 +198,14 @@ DECLARE_double(pool_elastic_deactivate_long_ratio);
 DECLARE_int32(pool_elastic_deactivate_persist_s);
 DECLARE_int32(pool_elastic_drain_timeout_ms);
 DECLARE_int32(pool_elastic_window_s);
+
+// P2 pressure-signal-driven elastic flags.
+DECLARE_bool(pool_elastic_use_pressure_signal);
+DECLARE_double(pool_elastic_activate_pressure_threshold);
+DECLARE_double(pool_elastic_activate_min_pressure);
+DECLARE_double(pool_elastic_deactivate_pressure_threshold);
+DECLARE_int32(pool_elastic_activation_cool_down_s);
+DECLARE_double(pool_elastic_pressure_load_weight);
+DECLARE_double(pool_elastic_pressure_wait_weight);
+DECLARE_double(pool_elastic_pressure_pft_weight);
+DECLARE_int32(pool_elastic_pressure_pft_baseline_ms);

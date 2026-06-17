@@ -987,3 +987,57 @@ DEFINE_int32(pool_elastic_drain_timeout_ms,
 DEFINE_int32(pool_elastic_window_s,
              30,
              "Rolling window in seconds for long-request ratio computation.");
+
+// Pool elasticity P2: pressure-signal-driven decisions.
+// When use_pressure_signal=true the controller decides activation/deactivation
+// from an aggregated ACTIVE-pool pressure metric instead of (or in addition to)
+// the raw long_ratio. Defaults are tuned so that with the flag off behavior
+// matches the long_ratio-only path bit-for-bit; flipping the flag on enables
+// the dual-signal logic without touching any other tunable.
+DEFINE_bool(pool_elastic_use_pressure_signal,
+            false,
+            "Master switch for the P2 pressure-driven decision path. When "
+            "false, falls back to the legacy long_ratio-only logic.");
+
+DEFINE_double(pool_elastic_activate_pressure_threshold,
+              4.0,
+              "Aggregated pressure level above which an IDLE elastic instance "
+              "is activated immediately, regardless of long_ratio.");
+
+DEFINE_double(pool_elastic_activate_min_pressure,
+              1.0,
+              "When long_ratio >= activate_long_ratio AND pool_pressure >= "
+              "this min_pressure, activate as well. Lets long-ratio still "
+              "drive activation, but only when the pool is at least slightly "
+              "loaded (avoid waking instances under zero load).");
+
+DEFINE_double(pool_elastic_deactivate_pressure_threshold,
+              1.0,
+              "Aggregated pressure level below which an ACTIVE elastic "
+              "instance starts the deactivation timer.");
+
+DEFINE_int32(pool_elastic_activation_cool_down_s,
+             15,
+             "Minimum seconds between successive IDLE->ACTIVE activations. "
+             "Prevents stair-step controllers from waking the entire IDLE set "
+             "in a single tick.");
+
+DEFINE_double(pool_elastic_pressure_load_weight,
+              1.0,
+              "Weight applied to combined_load when aggregating pool pressure.");
+
+DEFINE_double(pool_elastic_pressure_wait_weight,
+              1.0,
+              "Weight applied to waiting_requests when aggregating pool "
+              "pressure.");
+
+DEFINE_double(pool_elastic_pressure_pft_weight,
+              0.5,
+              "Weight applied to projected_prefill_time_ms / pft_baseline_ms "
+              "when aggregating pool pressure.");
+
+DEFINE_int32(pool_elastic_pressure_pft_baseline_ms,
+             2000,
+             "Reference projected_prefill_time_ms used to normalize the PFT "
+             "term in the pressure aggregator. PFT >= baseline contributes "
+             "weight_pft to the pressure.");

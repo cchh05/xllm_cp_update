@@ -141,6 +141,14 @@ class InstanceMgr final {
   // (an array) without depending on header users including the JSON header
   // beyond what they already do.
   nlohmann::json build_pool_state_change_event_json(uint64_t window_ms) const;
+  // P2 pressure aggregator: returns max over ACTIVE prefill / mix instances of
+  //   load_w * combined_load
+  // + wait_w * waiting_requests
+  // + pft_w  * (projected_prefill_time_ms / pft_baseline_ms)
+  // Caller must hold cluster_mutex_ AND metrics_mutex_ (both in shared mode is
+  // sufficient; the helper only reads). Returns 0.0 when the ACTIVE set is
+  // empty.
+  double compute_pool_pressure_locked() const;
 
   // Resolve the initial runtime_state for a freshly registered instance, or
   // for one that has just exited a lifecycle transient (REGISTERING / SUSPECT
