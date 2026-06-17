@@ -259,6 +259,15 @@ class InstanceMgr final {
   std::deque<PoolElasticTransition> pool_elastic_events_;
   static constexpr size_t kPoolElasticEventsCap = 256;
 
+  // P2 step-activation cool down at the controller (pool) level. The
+  // tick_pool_elasticity loop refuses to activate ANY new IDLE instance
+  // within pool_elastic_activation_cool_down_s of this timestamp. This is
+  // the correct level for "step activation": with N IDLE instances we want
+  // them coming up one at a time across multiple ticks, not all together
+  // because each instance's own last_activated_ts_ms is still 0. Guarded
+  // by cluster_mutex_ (the only path that touches it is tick).
+  uint64_t last_pool_activation_ts_ms_ = 0;
+
   ThreadPool threadpool_;
   std::unique_ptr<std::thread> state_reconcile_thread_;
 };

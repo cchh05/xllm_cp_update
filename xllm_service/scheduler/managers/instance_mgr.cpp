@@ -1539,39 +1539,51 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
   // (smallest last_activated_ts_ms; 0 wins). This avoids promoting the entire
   // IDLE pool in a single tick and gives the controller a chance to observe
   // how the cluster reacts before promoting more.
+  //
+  // Cool-down is enforced at the CONTROLLER level (last_pool_activation_ts_ms_)
+  // rather than per-instance: with N IDLE instances every instance's own
+  // last_activated_ts_ms is still 0 at process start, so a per-instance check
+  // would happily wake all of them in a single tick. The pool-level timer
+  // forces successive activations to be at least cool_down_s apart.
+  const uint64_t cool_down_ms = static_cast<uint64_t>(std::max<int32_t>(
+      0, FLAGS_pool_elastic_activation_cool_down_s)) * 1000ULL;
   std::string activation_target;
   uint64_t activation_target_ts = std::numeric_limits<uint64_t>::max();
   if (use_pressure) {
-    for (auto& [inst_name, info] : instances_) {
-      if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
-        continue;
-      if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
-      bool is_elastic = false;
-      for (const auto& sel : elastic_selectors) {
-        if (instance_matches_selector(inst_name, sel)) {
-          is_elastic = true;
-          break;
+    const bool pool_cool_down_active =
+        last_pool_activation_ts_ms_ != 0 &&
+        now_ms - last_pool_activation_ts_ms_ < cool_down_ms;
+    if (!pool_cool_down_active) {
+      for (auto& [inst_name, info] : instances_) {
+        if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
+          continue;
+        if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
+        bool is_elastic = false;
+        for (const auto& sel : elastic_selectors) {
+          if (instance_matches_selector(inst_name, sel)) {
+            is_elastic = true;
+            break;
+          }
         }
-      }
-      if (!is_elastic) continue;
-      // Cool-down: don't even consider an instance that was just activated /
-      // most recently demoted within cool_down_s.
-      const uint64_t cool_down_ms = static_cast<uint64_t>(std::max<int32_t>(
-          0, FLAGS_pool_elastic_activation_cool_down_s)) * 1000ULL;
-      if (info.last_activated_ts_ms != 0 &&
-          now_ms - info.last_activated_ts_ms < cool_down_ms) {
-        continue;
-      }
-      // Pressure-driven activation gate.
-      const bool pressure_high =
-          pool_pressure >= FLAGS_pool_elastic_activate_pressure_threshold;
-      const bool long_ratio_high_with_load =
-          long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
-          pool_pressure >= FLAGS_pool_elastic_activate_min_pressure;
-      if (!(pressure_high || long_ratio_high_with_load)) continue;
-      if (info.last_activated_ts_ms < activation_target_ts) {
-        activation_target_ts = info.last_activated_ts_ms;
-        activation_target = inst_name;
+        if (!is_elastic) continue;
+        // Per-instance cool-down (defense in depth: if an instance was demoted
+        // and its info was just updated, also wait cool_down_s before flipping
+        // it back). Pool-level cool-down already gates the common case.
+        if (info.last_activated_ts_ms != 0 &&
+            now_ms - info.last_activated_ts_ms < cool_down_ms) {
+          continue;
+        }
+        // Pressure-driven activation gate.
+        const bool pressure_high =
+            pool_pressure >= FLAGS_pool_elastic_activate_pressure_threshold;
+        const bool long_ratio_high_with_load =
+            long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
+            pool_pressure >= FLAGS_pool_elastic_activate_min_pressure;
+        if (!(pressure_high || long_ratio_high_with_load)) continue;
+        if (info.last_activated_ts_ms < activation_target_ts) {
+          activation_target_ts = info.last_activated_ts_ms;
+          activation_target = inst_name;
+        }
       }
     }
   }
@@ -1612,6 +1624,10 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
           info.last_activated_ts_ms = now_ms;
+          // Pool-level cool-down anchor: subsequent ticks within
+          // pool_elastic_activation_cool_down_s will refuse to promote any
+          // other IDLE instance, regardless of pressure.
+          last_pool_activation_ts_ms_ = now_ms;
           LOG(INFO) << "Pool elastic state change: " << inst_name
                     << " IDLE->ACTIVE, long_ratio=" << long_ratio
                     << " pool_pressure=" << pool_pressure
