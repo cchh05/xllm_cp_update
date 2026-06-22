@@ -1090,3 +1090,21 @@ DEFINE_double(pool_elastic_target_pressure_per_instance,
               "gives the desired ACTIVE count, then clamped to "
               "[min_active, max_active]. Lower value -> more ACTIVE under "
               "the same load; higher value -> fewer ACTIVE (denser packing).");
+
+// P5: lane-aware activation. The controller looks at each instance's
+// kv_split_size as a proxy for "is this a long-request CP big lane (>1) or a
+// short-request small P (<=1)" and biases activation/demotion choices
+// accordingly. Off by default to preserve P4-NEW behavior; turn on when the
+// elastic pool spans both kinds of instances.
+DEFINE_bool(pool_elastic_lane_aware,
+            false,
+            "Enable lane-aware activation: prefer cp_size>1 instances when "
+            "long_ratio is high, prefer cp_size<=1 instances otherwise. Soft "
+            "preference only; falls back to any eligible instance if the "
+            "preferred lane is exhausted.");
+
+DEFINE_double(pool_elastic_lane_aware_threshold_long_ratio,
+              0.30,
+              "Long-request rolling ratio threshold above which the lane-"
+              "aware picker prefers cp_size>1 instances. Below this, it "
+              "prefers cp_size<=1.");

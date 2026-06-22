@@ -215,3 +215,5 @@ DECLARE_bool(pool_elastic_auto_mode);
 DECLARE_int32(pool_elastic_min_active);
 DECLARE_int32(pool_elastic_max_active);
 DECLARE_double(pool_elastic_target_pressure_per_instance);
+DECLARE_bool(pool_elastic_lane_aware);
+DECLARE_double(pool_elastic_lane_aware_threshold_long_ratio);

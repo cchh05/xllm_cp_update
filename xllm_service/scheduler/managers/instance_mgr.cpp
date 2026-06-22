@@ -794,6 +794,8 @@ bool InstanceMgr::get_next_instance_pair(const std::shared_ptr<Request>& request
              FLAGS_pool_elastic_window_s, current_time_ms())},
         {"pool_active_set", snapshot_active_prefill_instances_locked()},
         {"pool_pressure_now", compute_pool_pressure_locked()},
+        {"pool_pressure_long_lane", compute_pool_pressure_lane_locked(1)},
+        {"pool_pressure_short_lane", compute_pool_pressure_lane_locked(2)},
         {"pool_elastic_use_pressure_signal",
          FLAGS_pool_elastic_use_pressure_signal},
         {"pool_state_change_event",
@@ -1625,8 +1627,29 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
     }
   }
 
-  // Pick activation_target = oldest IDLE instance (by last_activated_ts_ms).
+  // P5: lane-aware preference. When long_ratio >= lane-aware threshold the
+  // controller prefers a long-lane (kv_split_size>1) candidate; otherwise it
+  // prefers a short-lane (kv_split_size<=1) candidate. The preference is a
+  // soft tie-break: if no candidate of the preferred lane is eligible, we
+  // fall back to any eligible IDLE instance (so an active scale-up never
+  // stalls because the ideal lane is exhausted).
+  const bool lane_aware =
+      FLAGS_pool_elastic_lane_aware &&
+      (auto_mode || use_pressure);  // only meaningful in pressure paths
+  const bool prefer_long_lane =
+      lane_aware && long_ratio >=
+                        FLAGS_pool_elastic_lane_aware_threshold_long_ratio;
+
+  auto matches_preferred_lane = [&](const InstanceMetaInfo& info) -> bool {
+    if (!lane_aware) return true;
+    if (prefer_long_lane) return info.kv_split_size > 1;
+    return info.kv_split_size <= 1;
+  };
+
+  // Pick activation_target = oldest IDLE instance (by last_activated_ts_ms),
+  // preferring the lane that matches current traffic shape if lane_aware is on.
   if (need_activate) {
+    // Pass 1: only consider IDLE instances of the preferred lane.
     for (auto& [inst_name, info] : instances_) {
       if (!is_elastic_inst(inst_name, info)) continue;
       if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
@@ -1634,9 +1657,25 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           now_ms - info.last_activated_ts_ms < cool_down_ms) {
         continue;
       }
+      if (!matches_preferred_lane(info)) continue;
       if (info.last_activated_ts_ms < activation_target_ts) {
         activation_target_ts = info.last_activated_ts_ms;
         activation_target = inst_name;
+      }
+    }
+    // Pass 2: fallback to any eligible IDLE instance.
+    if (activation_target.empty()) {
+      for (auto& [inst_name, info] : instances_) {
+        if (!is_elastic_inst(inst_name, info)) continue;
+        if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
+        if (info.last_activated_ts_ms != 0 &&
+            now_ms - info.last_activated_ts_ms < cool_down_ms) {
+          continue;
+        }
+        if (info.last_activated_ts_ms < activation_target_ts) {
+          activation_target_ts = info.last_activated_ts_ms;
+          activation_target = inst_name;
+        }
       }
     }
     if (activation_target.empty()) need_activate = false;
@@ -1645,21 +1684,44 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
   // Pick deactivation_target = ACTIVE instance least recently activated
   // (longest tenure as ACTIVE). Newly-promoted instances are protected.
   if (need_deactivate) {
+    // P5: prefer to demote the lane that does NOT match current traffic
+    // shape. Long burst -> demote cp_size<=1 first; short burst -> demote
+    // cp_size>1 first. Newest activation wins as tiebreaker so we don't
+    // demote an instance the controller just promoted.
+    auto matches_demote_preferred_lane =
+        [&](const InstanceMetaInfo& info) -> bool {
+          if (!lane_aware) return true;
+          if (prefer_long_lane) return info.kv_split_size <= 1;
+          return info.kv_split_size > 1;
+        };
+
+    // Pass 1: only demote-preferred-lane candidates.
     for (auto& [inst_name, info] : instances_) {
       if (!is_elastic_inst(inst_name, info)) continue;
       if (info.runtime_state != InstanceRuntimeState::ACTIVE) continue;
-      // Don't drain the always-on minimum: if min_active==1 and we have one
-      // ACTIVE, the loop above already prevented need_deactivate=true via
-      // the desired_active computation. This is a defensive check.
       if (info.last_activated_ts_ms == 0) continue;  // never tracked, skip
+      if (!matches_demote_preferred_lane(info)) continue;
       if (info.last_activated_ts_ms > deactivation_target_ts) {
         deactivation_target_ts = info.last_activated_ts_ms;
         deactivation_target = inst_name;
       }
     }
-    // If we couldn't find a candidate (all ACTIVE have ts_ms==0, e.g. on first
-    // tick when "ACTIVE" instances were registered without ever being IDLE),
-    // pick the lexicographically-largest name as a deterministic fallback.
+    // Pass 2: fallback to any ACTIVE instance with last_activated_ts_ms set.
+    if (deactivation_target.empty()) {
+      for (auto& [inst_name, info] : instances_) {
+        if (!is_elastic_inst(inst_name, info)) continue;
+        if (info.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+        if (info.last_activated_ts_ms == 0) continue;
+        if (info.last_activated_ts_ms > deactivation_target_ts) {
+          deactivation_target_ts = info.last_activated_ts_ms;
+          deactivation_target = inst_name;
+        }
+      }
+    }
+    // If we still couldn't find a candidate (all ACTIVE have ts_ms==0,
+    // e.g. on first tick when "ACTIVE" instances were registered without
+    // ever being IDLE), pick the lexicographically-largest name as a
+    // deterministic fallback.
     if (deactivation_target.empty()) {
       for (auto& [inst_name, info] : instances_) {
         if (!is_elastic_inst(inst_name, info)) continue;
@@ -1703,6 +1765,9 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
                     << " pool_pressure=" << pool_pressure
                     << " desired_active=" << desired_active
                     << " active_count=" << active_count
+                    << " kv_split_size=" << info.kv_split_size
+                    << " lane_aware=" << (lane_aware ? 1 : 0)
+                    << " prefer_long_lane=" << (prefer_long_lane ? 1 : 0)
                     << " mode=" << (auto_mode ? "auto"
                                               : (use_pressure ? "pressure"
                                                               : "long_ratio"));
@@ -1756,6 +1821,9 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
                     << " desired_active=" << desired_active
                     << " active_count=" << active_count
                     << " combined_load=" << combined_load
+                    << " kv_split_size=" << info.kv_split_size
+                    << " lane_aware=" << (lane_aware ? 1 : 0)
+                    << " prefer_long_lane=" << (prefer_long_lane ? 1 : 0)
                     << " mode=" << (auto_mode ? "auto"
                                               : (use_pressure ? "pressure"
                                                               : "long_ratio"));
@@ -2027,6 +2095,10 @@ nlohmann::json InstanceMgr::build_pool_state_change_event_json(
 }
 
 double InstanceMgr::compute_pool_pressure_locked() const {
+  return compute_pool_pressure_lane_locked(/*lane_filter=*/0);
+}
+
+double InstanceMgr::compute_pool_pressure_lane_locked(int lane_filter) const {
   // Aggregator across the ACTIVE prefill / mix set:
   //   max over instances of:
   //     load_w * combined_load
@@ -2037,14 +2109,17 @@ double InstanceMgr::compute_pool_pressure_locked() const {
   // bigger backlog -> longer head-of-line wait. Using the raw
   // projected_prefill_time_ms would require running the time predictor here,
   // which is expensive and only meaningful per-request, not per-instance.
+  //
+  // P5: lane_filter selects which subset to aggregate over.
+  //     0 = entire pool (legacy behavior)
+  //     1 = long-lane subset (kv_split_size > 1)  <-- "CP big lane"
+  //     2 = short-lane subset (kv_split_size <= 1) <-- "non-CP small P"
+  // Other values fall back to the entire pool.
   const double load_w = FLAGS_pool_elastic_pressure_load_weight;
   const double wait_w = FLAGS_pool_elastic_pressure_wait_weight;
   const double pft_w  = FLAGS_pool_elastic_pressure_pft_weight;
   const int32_t pft_baseline_ms = std::max<int32_t>(
       1, FLAGS_pool_elastic_pressure_pft_baseline_ms);
-  // Reuse pft_baseline_ms as a token-budget proxy: a baseline of 2000ms
-  // roughly corresponds to ~16k tokens of prefill backlog on this hardware.
-  // Operators tune via the gflag; default keeps the term in [0,1] band.
   const double pft_baseline_tokens =
       static_cast<double>(pft_baseline_ms) * 8.0;
 
@@ -2053,6 +2128,8 @@ double InstanceMgr::compute_pool_pressure_locked() const {
     auto it = instances_.find(name);
     if (it == instances_.end()) continue;
     if (it->second.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+    if (lane_filter == 1 && it->second.kv_split_size <= 1) continue;
+    if (lane_filter == 2 && it->second.kv_split_size > 1) continue;
 
     const double load = static_cast<double>(
         get_prefill_combined_load(request_metrics_, load_metrics_, name));
@@ -3941,6 +4018,8 @@ bool InstanceMgr::select_instance_pair_on_slo(
              FLAGS_pool_elastic_window_s, current_time_ms())},
         {"pool_active_set", snapshot_active_prefill_instances_locked()},
         {"pool_pressure_now", compute_pool_pressure_locked()},
+        {"pool_pressure_long_lane", compute_pool_pressure_lane_locked(1)},
+        {"pool_pressure_short_lane", compute_pool_pressure_lane_locked(2)},
         {"pool_elastic_use_pressure_signal",
          FLAGS_pool_elastic_use_pressure_signal},
         {"pool_state_change_event",

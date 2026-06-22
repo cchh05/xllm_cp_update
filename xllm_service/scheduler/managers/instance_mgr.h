@@ -149,6 +149,10 @@ class InstanceMgr final {
   // sufficient; the helper only reads). Returns 0.0 when the ACTIVE set is
   // empty.
   double compute_pool_pressure_locked() const;
+  // P5: lane-aware variant. lane_filter=1 -> only kv_split_size>1 (long lane,
+  // CP big lane); lane_filter=2 -> only kv_split_size<=1 (short lane / small
+  // P); 0 / other -> entire pool (legacy).
+  double compute_pool_pressure_lane_locked(int lane_filter) const;
 
   // Resolve the initial runtime_state for a freshly registered instance, or
   // for one that has just exited a lifecycle transient (REGISTERING / SUSPECT
