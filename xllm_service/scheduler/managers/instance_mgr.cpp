@@ -1679,6 +1679,14 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           info.runtime_state = InstanceRuntimeState::IDLE;
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
+          // P2.1.1: a freshly-drained instance must observe cool_down_s
+          // before it can be re-activated. Without this, a high-pressure
+          // pool can flap an instance IDLE -> ACTIVE within 1 second of
+          // DRAINING -> IDLE, defeating the whole point of step activation.
+          // We refresh both the per-instance and pool-level anchors so the
+          // next activation tick treats this instance like a recent winner.
+          info.last_activated_ts_ms = now_ms;
+          last_pool_activation_ts_ms_ = now_ms;
           LOG(INFO) << "Pool elastic state change: " << inst_name
                     << " DRAINING->IDLE, combined_load=" << combined_load
                     << " pool_pressure=" << pool_pressure;
