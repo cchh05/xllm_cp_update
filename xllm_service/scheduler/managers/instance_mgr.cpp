@@ -2118,10 +2118,19 @@ double InstanceMgr::compute_pool_pressure_lane_locked(int lane_filter) const {
   const double load_w = FLAGS_pool_elastic_pressure_load_weight;
   const double wait_w = FLAGS_pool_elastic_pressure_wait_weight;
   const double pft_w  = FLAGS_pool_elastic_pressure_pft_weight;
-  const int32_t pft_baseline_ms = std::max<int32_t>(
-      1, FLAGS_pool_elastic_pressure_pft_baseline_ms);
-  const double pft_baseline_tokens =
-      static_cast<double>(pft_baseline_ms) * 8.0;
+  // P7: token budget for PFT normalization is now directly configurable via
+  // pool_elastic_pressure_pft_baseline_tokens. The old pft_baseline_ms gflag
+  // is kept for backward compatibility: if pft_baseline_tokens<=0 we fall
+  // back to the legacy 8x conversion (1ms ~= 8 tokens) so existing operators
+  // get the same behavior. Setting baseline_tokens explicitly bypasses the
+  // implicit conversion entirely.
+  double pft_baseline_tokens = static_cast<double>(
+      std::max<int32_t>(0, FLAGS_pool_elastic_pressure_pft_baseline_tokens));
+  if (pft_baseline_tokens <= 0.0) {
+    const int32_t pft_baseline_ms = std::max<int32_t>(
+        1, FLAGS_pool_elastic_pressure_pft_baseline_ms);
+    pft_baseline_tokens = static_cast<double>(pft_baseline_ms) * 8.0;
+  }
 
   double max_pressure = 0.0;
   for (const auto& name : prefill_index_) {
@@ -2970,6 +2979,28 @@ bool InstanceMgr::select_instance_pair_on_slo(
       candidate.waiting_penalty =
           static_cast<double>(candidate.waiting_requests) *
           FLAGS_hybrid_prefill_waiting_requests_weight;
+      // P6: grace period for freshly-activated elastic instances. Within
+      // pool_elastic_grace_period_s after the last IDLE->ACTIVE transition,
+      // scale the waiting_penalty by pool_elastic_grace_waiting_factor (default
+      // 0.5). This prevents the "first request lands -> waiting+1 -> next
+      // request avoids it -> waiting stays high vs other ACTIVE -> never
+      // selected again" feedback trap that we saw in P2 r1 with
+      // waiting_requests_weight=28.
+      if (FLAGS_pool_elastic_grace_period_s > 0) {
+        const auto inst_it = instances_.find(prefill_instance);
+        if (inst_it != instances_.end() &&
+            inst_it->second.last_activated_ts_ms != 0) {
+          const uint64_t now_ms_grace = current_time_ms();
+          const uint64_t age_ms =
+              now_ms_grace - inst_it->second.last_activated_ts_ms;
+          const uint64_t grace_ms = static_cast<uint64_t>(std::max<int32_t>(
+              0, FLAGS_pool_elastic_grace_period_s)) * 1000ULL;
+          if (age_ms < grace_ms) {
+            candidate.waiting_penalty *=
+                FLAGS_pool_elastic_grace_waiting_factor;
+          }
+        }
+      }
       candidate.prefill_time =
           request_metrics_[prefill_instance].estimated_prefill_time;
       candidate.predicted_request_ttft =

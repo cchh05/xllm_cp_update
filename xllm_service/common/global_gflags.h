@@ -209,6 +209,7 @@ DECLARE_double(pool_elastic_pressure_load_weight);
 DECLARE_double(pool_elastic_pressure_wait_weight);
 DECLARE_double(pool_elastic_pressure_pft_weight);
 DECLARE_int32(pool_elastic_pressure_pft_baseline_ms);
+DECLARE_int32(pool_elastic_pressure_pft_baseline_tokens);
 
 // P4-NEW: cluster-aware auto-classification flags.
 DECLARE_bool(pool_elastic_auto_mode);
@@ -217,3 +218,5 @@ DECLARE_int32(pool_elastic_max_active);
 DECLARE_double(pool_elastic_target_pressure_per_instance);
 DECLARE_bool(pool_elastic_lane_aware);
 DECLARE_double(pool_elastic_lane_aware_threshold_long_ratio);
+DECLARE_int32(pool_elastic_grace_period_s);
+DECLARE_double(pool_elastic_grace_waiting_factor);

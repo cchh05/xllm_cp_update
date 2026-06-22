@@ -1042,6 +1042,17 @@ DEFINE_int32(pool_elastic_pressure_pft_baseline_ms,
              "term in the pressure aggregator. PFT >= baseline contributes "
              "weight_pft to the pressure.");
 
+// P7: explicit token budget so operators don't depend on the implicit
+// 8x ms<->tokens conversion. When > 0 this takes precedence over
+// pft_baseline_ms; when 0 (default) the legacy conversion still applies so
+// existing envs are unaffected.
+DEFINE_int32(pool_elastic_pressure_pft_baseline_tokens,
+             0,
+             "Direct token-budget reference for the PFT term. When > 0, used "
+             "as the divisor for current_prefill_tokens. When 0, falls back "
+             "to pft_baseline_ms * 8 (legacy heuristic). Operators tuning for "
+             "a specific hardware/model should set this explicitly.");
+
 // P4-NEW: cluster-aware auto-classification.
 //
 // When pool_elastic_idle_default_instances is empty (or pool_elastic_auto_mode
@@ -1108,3 +1119,24 @@ DEFINE_double(pool_elastic_lane_aware_threshold_long_ratio,
               "Long-request rolling ratio threshold above which the lane-"
               "aware picker prefers cp_size>1 instances. Below this, it "
               "prefers cp_size<=1.");
+
+// P6: hb scoring grace period for freshly-activated instances. After an
+// IDLE->ACTIVE transition the new ACTIVE has waiting_requests=0 by
+// construction, but on the very next request it accumulates waiting+1 while
+// already-ACTIVE veterans hover at some baseline. With high
+// waiting_requests_weight (e.g. 28) the gap is amplified into a 100+ point
+// penalty, which can permanently suppress the new instance via a feedback
+// loop. The grace period damps this by scaling its waiting_penalty during a
+// short post-activation window.
+DEFINE_int32(pool_elastic_grace_period_s,
+             60,
+             "Duration in seconds after IDLE->ACTIVE during which the elastic "
+             "instance gets a reduced waiting_penalty to avoid the feedback "
+             "trap. 0 disables the grace period entirely.");
+
+DEFINE_double(pool_elastic_grace_waiting_factor,
+              0.5,
+              "Multiplier applied to waiting_penalty for freshly-activated "
+              "elastic instances during the grace period. 0.5 halves the "
+              "penalty; 0 ignores waiting entirely; 1.0 disables the grace "
+              "scaling without disabling the period.");
