@@ -1041,3 +1041,52 @@ DEFINE_int32(pool_elastic_pressure_pft_baseline_ms,
              "Reference projected_prefill_time_ms used to normalize the PFT "
              "term in the pressure aggregator. PFT >= baseline contributes "
              "weight_pft to the pressure.");
+
+// P4-NEW: cluster-aware auto-classification.
+//
+// When pool_elastic_idle_default_instances is empty (or pool_elastic_auto_mode
+// is true), the controller stops asking "which instances should start IDLE"
+// and instead asks "how many instances *should* be ACTIVE right now". The
+// answer is computed every tick from the aggregated pool pressure:
+//
+//   desired_active = clamp(
+//       ceil(pool_pressure / target_pressure_per_instance),
+//       min_active,
+//       max_active)
+//
+// The controller then converges toward desired_active by promoting one IDLE
+// instance per tick (subject to step-activation cool-down) when ACTIVE count
+// is too low, or demoting one ACTIVE instance to DRAINING when too high.
+//
+// On register_instance, the new arrival is auto-classified: if the current
+// ACTIVE count is below min_active it joins as ACTIVE, otherwise it joins as
+// IDLE and waits for the controller to promote it if needed. This makes the
+// pool gracefully accept new prefill instances added at runtime without any
+// selector-list churn.
+DEFINE_bool(pool_elastic_auto_mode,
+            true,
+            "Master switch for the P4-NEW cluster-aware auto-classification "
+            "path. When true, controller decides ACTIVE/IDLE membership from "
+            "min_active/max_active/target_pressure_per_instance without "
+            "needing an idle_default_instances selector. Set false to fall "
+            "back to the selector-based legacy path.");
+
+DEFINE_int32(pool_elastic_min_active,
+             1,
+             "Minimum number of ACTIVE elastic instances at all times. The "
+             "controller will refuse to demote below this floor and will "
+             "auto-promote on register if the running count is below it.");
+
+DEFINE_int32(pool_elastic_max_active,
+             0,
+             "Maximum number of ACTIVE elastic instances. 0 means unbounded "
+             "(use the entire registered prefill pool). The controller will "
+             "refuse to promote above this ceiling.");
+
+DEFINE_double(pool_elastic_target_pressure_per_instance,
+              5.0,
+              "Target aggregated pool_pressure each ACTIVE instance is "
+              "expected to comfortably handle. ceil(pool_pressure / this) "
+              "gives the desired ACTIVE count, then clamped to "
+              "[min_active, max_active]. Lower value -> more ACTIVE under "
+              "the same load; higher value -> fewer ACTIVE (denser packing).");

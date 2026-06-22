@@ -1513,11 +1513,22 @@ void InstanceMgr::update_latency_metrics(
 }
 
 void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
-  if (FLAGS_pool_elastic_idle_default_instances.empty()) return;
+  // Two ways to declare the elastic pool:
+  //   (1) selector list (legacy): pool_elastic_idle_default_instances names
+  //       which instances start IDLE. Other instances stay ACTIVE forever.
+  //   (2) auto mode (P4-NEW): pool_elastic_auto_mode=true. Every PREFILL/MIX
+  //       instance is treated as elastic, and the controller computes a
+  //       desired ACTIVE count from min_active/max_active/target_per_inst.
+  // If both are set, auto mode takes precedence; the legacy selector list is
+  // ignored. If neither is set, the controller does nothing.
+  const bool auto_mode = FLAGS_pool_elastic_auto_mode;
+  const bool selector_mode = !FLAGS_pool_elastic_idle_default_instances.empty();
+  if (!auto_mode && !selector_mode) return;
 
+  // Selector list parsed once (only used when auto_mode == false).
   static const std::vector<std::string> elastic_selectors =
       parse_instance_selectors(FLAGS_pool_elastic_idle_default_instances);
-  if (elastic_selectors.empty()) return;
+  if (!auto_mode && elastic_selectors.empty()) return;
 
   const double long_ratio = PoolElasticStats::instance().compute_long_ratio(
       FLAGS_pool_elastic_window_s, now_ms);
@@ -1525,81 +1536,143 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
       FLAGS_pool_elastic_window_s, now_ms);
   if (total_in_window == 0) return;
 
-  // P2 dual-signal mode: aggregate ACTIVE-pool pressure once per tick, then
-  // fold it into the per-instance state transitions below. When the master
-  // switch is off, pool_pressure stays at 0.0 and every comparison degrades
-  // to the legacy long_ratio-only logic.
   const bool use_pressure = FLAGS_pool_elastic_use_pressure_signal;
   std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
   const double pool_pressure =
       use_pressure ? compute_pool_pressure_locked() : 0.0;
 
-  // Step-activation: across the entire tick, allow at most one IDLE->ACTIVE
-  // promotion. The chosen instance is the one that has been IDLE longest
-  // (smallest last_activated_ts_ms; 0 wins). This avoids promoting the entire
-  // IDLE pool in a single tick and gives the controller a chance to observe
-  // how the cluster reacts before promoting more.
-  //
-  // Cool-down is enforced at the CONTROLLER level (last_pool_activation_ts_ms_)
-  // rather than per-instance: with N IDLE instances every instance's own
-  // last_activated_ts_ms is still 0 at process start, so a per-instance check
-  // would happily wake all of them in a single tick. The pool-level timer
-  // forces successive activations to be at least cool_down_s apart.
+  // Predicate: is this instance considered part of the elastic pool right now?
+  auto is_elastic_inst = [&](const std::string& name,
+                             const InstanceMetaInfo& info) -> bool {
+    if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
+      return false;
+    if (auto_mode) {
+      // In auto mode every prefill/mix instance is fair game.
+      return true;
+    }
+    for (const auto& sel : elastic_selectors) {
+      if (instance_matches_selector(name, sel)) return true;
+    }
+    return false;
+  };
+
+  // Count current ACTIVE / IDLE elastic instances.
+  int32_t active_count = 0;
+  int32_t idle_count = 0;
+  int32_t total_elastic = 0;
+  for (auto& [inst_name, info] : instances_) {
+    if (!is_elastic_inst(inst_name, info)) continue;
+    ++total_elastic;
+    if (info.runtime_state == InstanceRuntimeState::ACTIVE) ++active_count;
+    else if (info.runtime_state == InstanceRuntimeState::IDLE) ++idle_count;
+  }
+  if (total_elastic == 0) return;
+
+  // Desired ACTIVE count under auto mode. clamp(ceil(pressure / target_per_inst),
+  // min_active, max_active). max_active=0 means unbounded -> use total_elastic.
+  int32_t desired_active = active_count;  // legacy path keeps current count
+  if (auto_mode) {
+    const double target_per_inst = std::max(
+        0.001, FLAGS_pool_elastic_target_pressure_per_instance);
+    const int32_t pressure_demand =
+        use_pressure
+            ? static_cast<int32_t>(
+                  std::ceil(pool_pressure / target_per_inst))
+            : 1;  // no pressure signal -> fall back to min_active
+    const int32_t min_active =
+        std::max(0, FLAGS_pool_elastic_min_active);
+    const int32_t max_active_cap =
+        FLAGS_pool_elastic_max_active > 0
+            ? std::min(FLAGS_pool_elastic_max_active, total_elastic)
+            : total_elastic;
+    desired_active = std::clamp(pressure_demand, min_active, max_active_cap);
+  }
+
+  // Step-activation cool-down at the pool level. Limits how often the
+  // controller can change ACTIVE membership (in either direction).
   const uint64_t cool_down_ms = static_cast<uint64_t>(std::max<int32_t>(
       0, FLAGS_pool_elastic_activation_cool_down_s)) * 1000ULL;
+  const bool pool_cool_down_active =
+      last_pool_activation_ts_ms_ != 0 &&
+      now_ms - last_pool_activation_ts_ms_ < cool_down_ms;
+
+  // Decide on at most one promotion or one demotion this tick.
   std::string activation_target;
   uint64_t activation_target_ts = std::numeric_limits<uint64_t>::max();
-  if (use_pressure) {
-    const bool pool_cool_down_active =
-        last_pool_activation_ts_ms_ != 0 &&
-        now_ms - last_pool_activation_ts_ms_ < cool_down_ms;
+  std::string deactivation_target;
+  uint64_t deactivation_target_ts = 0;
+  bool need_activate = false;
+  bool need_deactivate = false;
+
+  if (auto_mode) {
+    if (active_count < desired_active && idle_count > 0 &&
+        !pool_cool_down_active) {
+      need_activate = true;
+    } else if (active_count > desired_active && active_count > 0 &&
+               !pool_cool_down_active) {
+      need_deactivate = true;
+    }
+  } else if (use_pressure) {
+    // Legacy selector path: activate when pressure or long_ratio crosses
+    // thresholds; deactivate via per-instance ACTIVE-state branch below.
     if (!pool_cool_down_active) {
-      for (auto& [inst_name, info] : instances_) {
-        if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
-          continue;
-        if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
-        bool is_elastic = false;
-        for (const auto& sel : elastic_selectors) {
-          if (instance_matches_selector(inst_name, sel)) {
-            is_elastic = true;
-            break;
-          }
-        }
-        if (!is_elastic) continue;
-        // Per-instance cool-down (defense in depth: if an instance was demoted
-        // and its info was just updated, also wait cool_down_s before flipping
-        // it back). Pool-level cool-down already gates the common case.
-        if (info.last_activated_ts_ms != 0 &&
-            now_ms - info.last_activated_ts_ms < cool_down_ms) {
-          continue;
-        }
-        // Pressure-driven activation gate.
-        const bool pressure_high =
-            pool_pressure >= FLAGS_pool_elastic_activate_pressure_threshold;
-        const bool long_ratio_high_with_load =
-            long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
-            pool_pressure >= FLAGS_pool_elastic_activate_min_pressure;
-        if (!(pressure_high || long_ratio_high_with_load)) continue;
-        if (info.last_activated_ts_ms < activation_target_ts) {
-          activation_target_ts = info.last_activated_ts_ms;
-          activation_target = inst_name;
-        }
+      const bool pressure_high =
+          pool_pressure >= FLAGS_pool_elastic_activate_pressure_threshold;
+      const bool long_ratio_high_with_load =
+          long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
+          pool_pressure >= FLAGS_pool_elastic_activate_min_pressure;
+      if (pressure_high || long_ratio_high_with_load) need_activate = true;
+    }
+  }
+
+  // Pick activation_target = oldest IDLE instance (by last_activated_ts_ms).
+  if (need_activate) {
+    for (auto& [inst_name, info] : instances_) {
+      if (!is_elastic_inst(inst_name, info)) continue;
+      if (info.runtime_state != InstanceRuntimeState::IDLE) continue;
+      if (info.last_activated_ts_ms != 0 &&
+          now_ms - info.last_activated_ts_ms < cool_down_ms) {
+        continue;
+      }
+      if (info.last_activated_ts_ms < activation_target_ts) {
+        activation_target_ts = info.last_activated_ts_ms;
+        activation_target = inst_name;
       }
     }
+    if (activation_target.empty()) need_activate = false;
+  }
+
+  // Pick deactivation_target = ACTIVE instance least recently activated
+  // (longest tenure as ACTIVE). Newly-promoted instances are protected.
+  if (need_deactivate) {
+    for (auto& [inst_name, info] : instances_) {
+      if (!is_elastic_inst(inst_name, info)) continue;
+      if (info.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+      // Don't drain the always-on minimum: if min_active==1 and we have one
+      // ACTIVE, the loop above already prevented need_deactivate=true via
+      // the desired_active computation. This is a defensive check.
+      if (info.last_activated_ts_ms == 0) continue;  // never tracked, skip
+      if (info.last_activated_ts_ms > deactivation_target_ts) {
+        deactivation_target_ts = info.last_activated_ts_ms;
+        deactivation_target = inst_name;
+      }
+    }
+    // If we couldn't find a candidate (all ACTIVE have ts_ms==0, e.g. on first
+    // tick when "ACTIVE" instances were registered without ever being IDLE),
+    // pick the lexicographically-largest name as a deterministic fallback.
+    if (deactivation_target.empty()) {
+      for (auto& [inst_name, info] : instances_) {
+        if (!is_elastic_inst(inst_name, info)) continue;
+        if (info.runtime_state != InstanceRuntimeState::ACTIVE) continue;
+        if (inst_name > deactivation_target) deactivation_target = inst_name;
+      }
+    }
+    if (deactivation_target.empty()) need_deactivate = false;
   }
 
   std::vector<PoolElasticTransition> transitions;
   for (auto& [inst_name, info] : instances_) {
-    if (info.type != InstanceType::PREFILL && info.type != InstanceType::MIX)
-      continue;
-    bool is_elastic = false;
-    for (const auto& sel : elastic_selectors) {
-      if (instance_matches_selector(inst_name, sel)) {
-        is_elastic = true;
-        break;
-      }
-    }
-    if (!is_elastic) continue;
+    if (!is_elastic_inst(inst_name, info)) continue;
 
     const uint64_t combined_load = get_prefill_combined_load(
         request_metrics_, load_metrics_, inst_name);
@@ -1609,11 +1682,11 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
     switch (info.runtime_state) {
       case InstanceRuntimeState::IDLE: {
         bool should_activate = false;
-        if (use_pressure) {
-          // Only the single chosen activation_target promotes this tick.
-          should_activate = (inst_name == activation_target);
+        if (auto_mode) {
+          should_activate = need_activate && (inst_name == activation_target);
+        } else if (use_pressure) {
+          should_activate = need_activate && (inst_name == activation_target);
         } else {
-          // Legacy path: long_ratio-only.
           should_activate =
               long_ratio >= FLAGS_pool_elastic_activate_long_ratio &&
               static_cast<int32_t>(combined_load) >=
@@ -1624,51 +1697,68 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
           info.last_activated_ts_ms = now_ms;
-          // Pool-level cool-down anchor: subsequent ticks within
-          // pool_elastic_activation_cool_down_s will refuse to promote any
-          // other IDLE instance, regardless of pressure.
           last_pool_activation_ts_ms_ = now_ms;
           LOG(INFO) << "Pool elastic state change: " << inst_name
                     << " IDLE->ACTIVE, long_ratio=" << long_ratio
                     << " pool_pressure=" << pool_pressure
-                    << " mode=" << (use_pressure ? "pressure" : "long_ratio");
+                    << " desired_active=" << desired_active
+                    << " active_count=" << active_count
+                    << " mode=" << (auto_mode ? "auto"
+                                              : (use_pressure ? "pressure"
+                                                              : "long_ratio"));
         }
         break;
       }
       case InstanceRuntimeState::ACTIVE: {
-        bool below_deactivate = false;
-        if (use_pressure) {
-          below_deactivate =
-              pool_pressure < FLAGS_pool_elastic_deactivate_pressure_threshold;
+        bool should_deactivate = false;
+        if (auto_mode) {
+          // In auto mode, deactivation is fully driven by desired_active.
+          // Per-instance ACTIVE -> DRAINING happens immediately when picked
+          // (no persist timer needed; the desired_active itself smoothes
+          // over short pressure dips by virtue of clamp + cool-down).
+          should_deactivate =
+              need_deactivate && (inst_name == deactivation_target);
         } else {
-          below_deactivate =
-              long_ratio < FLAGS_pool_elastic_deactivate_long_ratio;
-        }
-        if (below_deactivate) {
-          // Per-instance counter: a single elastic instance "leaving the busy
-          // band" must not reset the timer for any other elastic instance.
-          if (info.deactivate_condition_since_ms == 0) {
-            info.deactivate_condition_since_ms = now_ms;
+          // Legacy path: persist-timer + threshold gate.
+          bool below_deactivate = false;
+          if (use_pressure) {
+            below_deactivate =
+                pool_pressure <
+                FLAGS_pool_elastic_deactivate_pressure_threshold;
+          } else {
+            below_deactivate =
+                long_ratio < FLAGS_pool_elastic_deactivate_long_ratio;
           }
-          const uint64_t persist_ms =
-              now_ms - info.deactivate_condition_since_ms;
-          if (persist_ms >=
-              static_cast<uint64_t>(FLAGS_pool_elastic_deactivate_persist_s) *
-                  1000) {
-            if (combined_load == 0) {
-              info.runtime_state = InstanceRuntimeState::DRAINING;
-              info.draining_since_ms = now_ms;
-              info.deactivate_condition_since_ms = 0;
-              LOG(INFO) << "Pool elastic state change: " << inst_name
-                        << " ACTIVE->DRAINING, long_ratio=" << long_ratio
-                        << " pool_pressure=" << pool_pressure
-                        << " persist_ms=" << persist_ms
-                        << " mode=" << (use_pressure ? "pressure"
-                                                     : "long_ratio");
+          if (below_deactivate) {
+            if (info.deactivate_condition_since_ms == 0) {
+              info.deactivate_condition_since_ms = now_ms;
             }
+            const uint64_t persist_ms =
+                now_ms - info.deactivate_condition_since_ms;
+            if (persist_ms >=
+                static_cast<uint64_t>(
+                    FLAGS_pool_elastic_deactivate_persist_s) * 1000 &&
+                combined_load == 0) {
+              should_deactivate = true;
+            }
+          } else {
+            info.deactivate_condition_since_ms = 0;
           }
-        } else {
+        }
+        if (should_deactivate) {
+          info.runtime_state = InstanceRuntimeState::DRAINING;
+          info.draining_since_ms = now_ms;
           info.deactivate_condition_since_ms = 0;
+          last_pool_activation_ts_ms_ = now_ms;
+          LOG(INFO) << "Pool elastic state change: " << inst_name
+                    << " ACTIVE->DRAINING, long_ratio=" << long_ratio
+                    << " pool_pressure=" << pool_pressure
+                    << " desired_active=" << desired_active
+                    << " active_count=" << active_count
+                    << " combined_load=" << combined_load
+                    << " mode=" << (auto_mode ? "auto"
+                                              : (use_pressure ? "pressure"
+                                                              : "long_ratio"));
         }
         break;
       }
@@ -1679,12 +1769,6 @@ void InstanceMgr::tick_pool_elasticity(uint64_t now_ms) {
           info.runtime_state = InstanceRuntimeState::IDLE;
           info.draining_since_ms = 0;
           info.deactivate_condition_since_ms = 0;
-          // P2.1.1: a freshly-drained instance must observe cool_down_s
-          // before it can be re-activated. Without this, a high-pressure
-          // pool can flap an instance IDLE -> ACTIVE within 1 second of
-          // DRAINING -> IDLE, defeating the whole point of step activation.
-          // We refresh both the per-instance and pool-level anchors so the
-          // next activation tick treats this instance like a recent winner.
           info.last_activated_ts_ms = now_ms;
           last_pool_activation_ts_ms_ = now_ms;
           LOG(INFO) << "Pool elastic state change: " << inst_name
@@ -1830,6 +1914,27 @@ InstanceRuntimeState InstanceMgr::resolve_initial_runtime_state(
       info.type != InstanceType::MIX) {
     return InstanceRuntimeState::ACTIVE;
   }
+
+  // P4-NEW: auto-classify a freshly-registered prefill/mix instance based on
+  // the *current* ACTIVE count in the elastic pool. If we're below
+  // min_active, the new arrival joins as ACTIVE so cold-start can be served
+  // immediately. Otherwise it joins as IDLE and the controller will promote
+  // it later if pool_pressure rises.
+  if (FLAGS_pool_elastic_auto_mode) {
+    const int32_t min_active =
+        std::max(0, FLAGS_pool_elastic_min_active);
+    int32_t active_elastic = 0;
+    for (const auto& [n, i] : instances_) {
+      if (n == name) continue;  // exclude the instance being registered
+      if (i.type != InstanceType::PREFILL && i.type != InstanceType::MIX)
+        continue;
+      if (i.runtime_state == InstanceRuntimeState::ACTIVE) ++active_elastic;
+    }
+    return active_elastic < min_active ? InstanceRuntimeState::ACTIVE
+                                        : InstanceRuntimeState::IDLE;
+  }
+
+  // Legacy selector path.
   if (FLAGS_pool_elastic_idle_default_instances.empty()) {
     return InstanceRuntimeState::ACTIVE;
   }
@@ -4167,9 +4272,22 @@ bool InstanceMgr::register_instance(const std::string& name,
               << ", decode_index_size=" << decode_index_.size();
 
     if (it->second.runtime_state == InstanceRuntimeState::IDLE) {
+      if (FLAGS_pool_elastic_auto_mode) {
+        LOG(INFO) << "Pool elastic init: " << name
+                  << " set to IDLE (auto-mode, current ACTIVE elastic count "
+                  << "already meets min_active="
+                  << FLAGS_pool_elastic_min_active << ")";
+      } else {
+        LOG(INFO) << "Pool elastic init: " << name
+                  << " set to IDLE (matches elastic selector list '"
+                  << FLAGS_pool_elastic_idle_default_instances << "')";
+      }
+    } else if (FLAGS_pool_elastic_auto_mode &&
+               (it->second.type == InstanceType::PREFILL ||
+                it->second.type == InstanceType::MIX)) {
       LOG(INFO) << "Pool elastic init: " << name
-                << " set to IDLE (matches elastic selector list '"
-                << FLAGS_pool_elastic_idle_default_instances << "')";
+                << " set to ACTIVE (auto-mode, ACTIVE elastic count below "
+                << "min_active=" << FLAGS_pool_elastic_min_active << ")";
     }
   }
   return true;
@@ -4228,6 +4346,22 @@ void InstanceMgr::deregister_instance(
     instances_.erase(it);
   }
   LOG(INFO) << "delete instance: " << name;
+
+  // P4-NEW: in auto mode, deregistering an ACTIVE elastic instance can drop
+  // the live ACTIVE count below min_active. Trigger an immediate elasticity
+  // tick so an IDLE replacement can be promoted right away, without waiting
+  // for the next 1Hz reconcile_instance_states loop. Bypass cool-down because
+  // a dropped ACTIVE is an emergency, not a normal scale-up.
+  if (FLAGS_pool_elastic_auto_mode &&
+      info.runtime_state == InstanceRuntimeState::ACTIVE &&
+      (info.type == InstanceType::PREFILL ||
+       info.type == InstanceType::MIX)) {
+    {
+      std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
+      last_pool_activation_ts_ms_ = 0;  // bypass cool-down for emergency
+    }
+    tick_pool_elasticity(current_time_ms());
+  }
 }
 
 void InstanceMgr::add_instance_resources(const std::string& name,
