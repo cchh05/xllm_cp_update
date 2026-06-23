@@ -3888,11 +3888,41 @@ bool InstanceMgr::gather_link_operations(
       break;
     }
     case InstanceType::MIX: {
+      // For each peer, emit a link op in the engine D->P direction
+      // (xllm/core/distributed_runtime/llm_engine.cpp:link_cluster only
+      // supports D-side initiating link to P-side endpoints):
+      //   - peer is PREFILL  -> MIX acts as D, MIX calls LinkInstance(peer=P)
+      //   - peer is DECODE   -> MIX acts as P, peer (D) calls LinkInstance(peer=MIX)
+      //   - peer is DEFAULT  -> treat as P (single-instance topology)
+      //   - peer is MIX      -> bidirectional dual-register requires both
+      //                         sides; emit two ops, one per direction.
+      // Without this split, a freshly-registered MIX would push a single
+      // (MIX.rpc, peer) op for every peer, including DECODE peers, and the
+      // DECODE-link op would fail because the engine refuses MIX(D)->DECODE(P)
+      // links (the role assignment is wrong).
       for (const auto& [peer_name, peer_info] : instances_) {
         if (peer_name == info.name) {
           continue;
         }
-        out_ops->emplace_back(info.rpc_address, peer_info);
+        switch (peer_info.type) {
+          case InstanceType::PREFILL:
+          case InstanceType::DEFAULT:
+            // MIX is the D-side caller, peer (P) is the link target.
+            out_ops->emplace_back(info.rpc_address, peer_info);
+            break;
+          case InstanceType::DECODE:
+            // peer (D) is the caller, MIX (P) is the link target.
+            out_ops->emplace_back(peer_info.rpc_address, info);
+            break;
+          case InstanceType::MIX:
+            // Two MIX in the same topology: emit both directions so each
+            // can serve either role for the other.
+            out_ops->emplace_back(info.rpc_address, peer_info);
+            out_ops->emplace_back(peer_info.rpc_address, info);
+            break;
+          default:
+            break;
+        }
       }
       break;
     }
