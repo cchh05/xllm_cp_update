@@ -57,6 +57,7 @@ DECLARE_string(etcd_namespace);
 
 DECLARE_string(load_balance_policy);
 DECLARE_bool(enable_static_prefill_instance_split);
+DECLARE_bool(enable_mix_dual_register);
 DECLARE_string(static_prefill_short_instance_selectors);
 DECLARE_string(static_prefill_long_instance_selectors);
 DECLARE_bool(enable_static_prefill_soft_fallback);

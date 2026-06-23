@@ -1568,10 +1568,14 @@ void InstanceMgr::refresh_instance_registration(const std::string& name,
 
   // Preserve local scheduling/index state across etcd refreshes.
   const auto instance_index = it->second.instance_index;
+  const auto prefill_instance_index = it->second.prefill_instance_index;
+  const auto decode_instance_index = it->second.decode_instance_index;
   const auto current_type = it->second.current_type;
 
   it->second = info;
   it->second.instance_index = instance_index;
+  it->second.prefill_instance_index = prefill_instance_index;
+  it->second.decode_instance_index = decode_instance_index;
   it->second.current_type = current_type;
   it->second.latest_timestamp = current_time_ms();
   it->second.runtime_state = InstanceRuntimeState::ACTIVE;
@@ -3955,7 +3959,17 @@ void InstanceMgr::add_instance_to_index(const std::string& name,
       LOG(INFO) << "Register a new decode instance, instance name : " << name;
       break;
     case InstanceType::MIX:
-      if (decode_index_.size() > 0) {
+      if (FLAGS_enable_mix_dual_register) {
+        info.prefill_instance_index = prefill_index_.size();
+        prefill_index_.emplace_back(name);
+        info.decode_instance_index = decode_index_.size();
+        decode_index_.emplace_back(name);
+        info.instance_index = info.prefill_instance_index;
+        info.current_type = InstanceType::PREFILL;
+        LOG(INFO) << "Register a new dual-mode mix instance: " << name
+                  << " prefill_idx=" << info.prefill_instance_index
+                  << " decode_idx=" << info.decode_instance_index;
+      } else if (decode_index_.size() > 0) {
         info.instance_index = prefill_index_.size();
         info.current_type = InstanceType::PREFILL;
         prefill_index_.emplace_back(name);
@@ -3975,29 +3989,63 @@ void InstanceMgr::add_instance_to_index(const std::string& name,
 
 void InstanceMgr::remove_instance_from_index(const std::string& name,
                                              const InstanceMetaInfo& info) {
-  uint64_t index = info.instance_index;
-  if (index == -1) return;
-
-  auto remove_from_vec = [&](std::vector<std::string>& vec) {
-    if (index >= vec.size()) return;
-    std::swap(vec[index], vec.back());
-    instances_[vec[index]].instance_index = index;
+  auto remove_at = [&](std::vector<std::string>& vec, uint64_t idx,
+                       bool is_prefill) {
+    if (idx == static_cast<uint64_t>(-1) || idx >= vec.size()) return;
+    std::swap(vec[idx], vec.back());
+    if (is_prefill) {
+      auto& moved = instances_[vec[idx]];
+      if (moved.type == InstanceType::MIX &&
+          moved.prefill_instance_index != static_cast<uint64_t>(-1)) {
+        moved.prefill_instance_index = idx;
+        if (moved.current_type == InstanceType::PREFILL) {
+          moved.instance_index = idx;
+        }
+      } else {
+        moved.instance_index = idx;
+      }
+    } else {
+      auto& moved = instances_[vec[idx]];
+      if (moved.type == InstanceType::MIX &&
+          moved.decode_instance_index != static_cast<uint64_t>(-1)) {
+        moved.decode_instance_index = idx;
+        if (moved.current_type == InstanceType::DECODE) {
+          moved.instance_index = idx;
+        }
+      } else {
+        moved.instance_index = idx;
+      }
+    }
     vec.pop_back();
   };
+
+  if (info.type == InstanceType::MIX &&
+      info.prefill_instance_index != static_cast<uint64_t>(-1) &&
+      info.decode_instance_index != static_cast<uint64_t>(-1)) {
+    // Dual-registered MIX: pop from both vectors. Order matters when the
+    // tail of one vector is the same instance about to be popped from the
+    // other; the swap-with-back lambda already handles that.
+    remove_at(prefill_index_, info.prefill_instance_index, /*is_prefill=*/true);
+    remove_at(decode_index_, info.decode_instance_index, /*is_prefill=*/false);
+    return;
+  }
+
+  uint64_t index = info.instance_index;
+  if (index == static_cast<uint64_t>(-1)) return;
 
   switch (info.type) {
     case InstanceType::DEFAULT:
     case InstanceType::PREFILL:
-      remove_from_vec(prefill_index_);
+      remove_at(prefill_index_, index, /*is_prefill=*/true);
       break;
     case InstanceType::DECODE:
-      remove_from_vec(decode_index_);
+      remove_at(decode_index_, index, /*is_prefill=*/false);
       break;
     case InstanceType::MIX:
       if (info.current_type == InstanceType::PREFILL) {
-        remove_from_vec(prefill_index_);
+        remove_at(prefill_index_, index, /*is_prefill=*/true);
       } else {
-        remove_from_vec(decode_index_);
+        remove_at(decode_index_, index, /*is_prefill=*/false);
       }
       break;
     default:
@@ -4028,7 +4076,13 @@ bool InstanceMgr::has_available_instances() const {
         has_decode = true;
         break;
       case InstanceType::MIX:
-        if (info.current_type == InstanceType::PREFILL) {
+        if (info.prefill_instance_index != static_cast<uint64_t>(-1) &&
+            info.decode_instance_index != static_cast<uint64_t>(-1)) {
+          // Dual-registered MIX is simultaneously available as prefill and
+          // decode for routing purposes.
+          has_mix_as_prefill = true;
+          has_mix_as_decode = true;
+        } else if (info.current_type == InstanceType::PREFILL) {
           has_mix_as_prefill = true;
         } else if (info.current_type == InstanceType::DECODE) {
           has_mix_as_decode = true;

@@ -218,6 +218,12 @@ struct InstanceMetaInfo {
 
   uint64_t instance_index = -1;
 
+  // When MIX is dual-registered into both prefill_index_ and decode_index_,
+  // these two carry the per-vector position. instance_index above tracks the
+  // primary (prefill) registration so single-register paths still work.
+  uint64_t prefill_instance_index = -1;
+  uint64_t decode_instance_index = -1;
+
   // Used to indicate the exact instance type of a MIX type instance currently,
   // only used when the SLO Aware scheduling policy is enabled.
   InstanceType current_type = InstanceType::PREFILL;

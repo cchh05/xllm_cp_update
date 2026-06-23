@@ -107,6 +107,13 @@ DEFINE_bool(enable_static_prefill_instance_split,
             "Whether to route prefill requests to different prefill instance "
             "subsets based on prompt length.");
 
+DEFINE_bool(enable_mix_dual_register,
+            false,
+            "When true, a MIX instance is registered into both prefill_index_ "
+            "and decode_index_ so RR routing can pick it for either role. "
+            "When false (default), a MIX instance lives in exactly one index "
+            "and matches the legacy slo-aware behavior.");
+
 DEFINE_string(static_prefill_short_instance_selectors,
               "",
               "Comma-separated list of selectors for short-request prefill "
