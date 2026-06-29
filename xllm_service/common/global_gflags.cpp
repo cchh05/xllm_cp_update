@@ -963,3 +963,36 @@ DEFINE_int32(readiness_check_interval_s,
              "before starting and during runtime of the HTTP service.");
 
 BRPC_VALIDATE_GFLAG(readiness_check_interval_s, brpc::PositiveInteger);
+
+// P0 — prefix-aware routing (lightweight service-side prediction).
+// Maintains an LRU cache mapping (block-hash sequence) -> last-served
+// instance. When a new request comes in, candidate instances that
+// match a stored prefix earn an extra score bonus, biasing routing
+// toward instances likely to still hold the relevant KV blocks.
+DEFINE_bool(enable_prefix_aware_routing,
+            false,
+            "P0: enable lightweight service-side prefix-aware routing. "
+            "Records (prompt block hash sequence -> instance) and biases "
+            "future requests with overlapping prefixes back to the same "
+            "instance. Default false preserves existing behavior.");
+
+DEFINE_int32(prefix_aware_block_size_tokens,
+             128,
+             "P0: token granularity per block hash. Each block of this "
+             "many tokens contributes one xxhash value to the prefix "
+             "cache key. Larger -> coarser sharing; smaller -> finer.");
+
+BRPC_VALIDATE_GFLAG(prefix_aware_block_size_tokens, brpc::PositiveInteger);
+
+DEFINE_int32(prefix_aware_cache_capacity,
+             4096,
+             "P0: max number of entries in the prefix-aware LRU cache.");
+
+BRPC_VALIDATE_GFLAG(prefix_aware_cache_capacity, brpc::PositiveInteger);
+
+DEFINE_double(kv_cache_overlap_credit_per_block,
+              50.0,
+              "P0: per-matched-block bonus added to a candidate's "
+              "hybrid scoring when the prefix-aware cache shows it "
+              "served the same prompt prefix. Same units as "
+              "hybrid_prefill_*_affinity_bonus.");

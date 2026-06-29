@@ -1695,6 +1695,23 @@ bool InstanceMgr::select_instance_pair_on_slo(
       static_cast<size_t>(std::max<int32_t>(
           0, options_.long_request_threshold_tokens()));
   const int32_t request_tokens = static_cast<int32_t>(request->token_ids.size());
+
+  // === P0 prefix-aware routing: lookup ===
+  // Compute the request's block hash sequence and look up the longest
+  // matching prefix in the LRU cache. The matched instance (if any)
+  // earns a bonus inside evaluate_hybrid_candidate below.
+  std::vector<uint64_t> request_block_hashes;
+  size_t prefix_matched_blocks = 0;
+  std::string prefix_matched_instance;
+  if (FLAGS_enable_prefix_aware_routing) {
+    request_block_hashes = compute_request_block_hashes(request->token_ids);
+    if (!request_block_hashes.empty()) {
+      std::shared_lock<std::shared_mutex> pc_lock(prefix_cache_mutex_);
+      lookup_prefix_cache_locked(request_block_hashes,
+                                 &prefix_matched_blocks,
+                                 &prefix_matched_instance);
+    }
+  }
   const int64_t decode_work_tokens =
       estimate_decode_work_tokens(request, request_tokens, request_is_long);
   const int32_t hard_long_threshold =
@@ -2585,6 +2602,23 @@ bool InstanceMgr::select_instance_pair_on_slo(
         candidate.score_v0_2 -= candidate.decode_pressure_route_cost;
         candidate.score_v0_3 -= candidate.decode_pressure_route_cost;
         candidate.score -= candidate.decode_pressure_route_cost;
+      }
+
+      // === P0 prefix-aware routing: bonus ===
+      // If this candidate was the previous server for an overlapping
+      // prompt prefix, add a bonus proportional to matched block count.
+      // Bonus is in the same units as affinity_bonus (the existing
+      // hybrid scoring framework).
+      if (FLAGS_enable_prefix_aware_routing &&
+          prefix_matched_blocks > 0 &&
+          !prefix_matched_instance.empty() &&
+          prefill_instance == prefix_matched_instance) {
+        const double bonus =
+            static_cast<double>(prefix_matched_blocks) *
+            FLAGS_kv_cache_overlap_credit_per_block;
+        candidate.score_v0_2 += bonus;
+        candidate.score_v0_3 += bonus;
+        candidate.score += bonus;
       }
       if (candidate.short_long_lane_guarded &&
           FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject) {
@@ -3569,6 +3603,17 @@ bool InstanceMgr::select_instance_pair_on_slo(
     flip_prefill_to_decode(request->routing.prefill_name);
   }
 
+  // === P0 prefix-aware routing: insert ===
+  // After we've picked the prefill, record (block_hashes -> selected
+  // instance) so subsequent overlapping prefixes get steered back here.
+  if (FLAGS_enable_prefix_aware_routing &&
+      !request_block_hashes.empty() &&
+      !request->routing.prefill_name.empty()) {
+    std::unique_lock<std::shared_mutex> pc_lock(prefix_cache_mutex_);
+    insert_prefix_cache_locked(request_block_hashes,
+                               request->routing.prefill_name);
+  }
+
   return true;
 }
 
@@ -3698,6 +3743,112 @@ bool InstanceMgr::call_unlink_instance(const std::string& target_rpc_addr,
     return false;
   }
   return res.ok();
+}
+
+// === P0 prefix-aware routing helpers (lightweight service-side prediction) ===
+
+namespace {
+// Simple, dependency-free 64-bit FNV-1a hash. Avoids pulling xxhash. The
+// prefix cache only needs collision-resistance proportional to its
+// capacity (~thousands of keys), so FNV-1a is enough.
+inline uint64_t fnv1a_hash_block(const int32_t* tokens, size_t n) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t t = static_cast<uint32_t>(tokens[i]);
+    for (int b = 0; b < 4; ++b) {
+      h ^= static_cast<uint64_t>(t & 0xff);
+      h *= 0x100000001b3ULL;
+      t >>= 8;
+    }
+  }
+  return h;
+}
+}  // namespace
+
+std::vector<uint64_t> InstanceMgr::compute_request_block_hashes(
+    const std::vector<int32_t>& token_ids) const {
+  const int32_t block_size = std::max(
+      1, FLAGS_prefix_aware_block_size_tokens);
+  const size_t num_full_blocks = token_ids.size() / static_cast<size_t>(block_size);
+  std::vector<uint64_t> hashes;
+  hashes.reserve(num_full_blocks);
+  // Each block hash absorbs ALL preceding tokens via running state, so two
+  // requests with the same first N blocks produce the same first N hashes.
+  uint64_t running = 0xcbf29ce484222325ULL;
+  for (size_t b = 0; b < num_full_blocks; ++b) {
+    const int32_t* start = token_ids.data() + b * block_size;
+    // Mix this block's tokens into running state.
+    for (int32_t i = 0; i < block_size; ++i) {
+      uint32_t t = static_cast<uint32_t>(start[i]);
+      for (int k = 0; k < 4; ++k) {
+        running ^= static_cast<uint64_t>(t & 0xff);
+        running *= 0x100000001b3ULL;
+        t >>= 8;
+      }
+    }
+    hashes.push_back(running);
+  }
+  return hashes;
+}
+
+void InstanceMgr::lookup_prefix_cache_locked(
+    const std::vector<uint64_t>& block_hashes,
+    size_t* matched_blocks,
+    std::string* instance_name) const {
+  *matched_blocks = 0;
+  instance_name->clear();
+  if (block_hashes.empty()) return;
+  // Greedy longest-prefix lookup: try the full sequence first, then shrink
+  // from the tail until a hit or empty.
+  for (size_t len = block_hashes.size(); len > 0; --len) {
+    PrefixKey key(block_hashes.begin(), block_hashes.begin() + len);
+    auto it = prefix_cache_.find(key);
+    if (it != prefix_cache_.end()) {
+      *matched_blocks = len;
+      *instance_name = it->second.instance_name;
+      return;
+    }
+  }
+}
+
+void InstanceMgr::insert_prefix_cache_locked(
+    const std::vector<uint64_t>& block_hashes,
+    const std::string& instance_name) {
+  if (block_hashes.empty() || instance_name.empty()) return;
+  PrefixKey key = block_hashes;
+  auto it = prefix_cache_.find(key);
+  if (it != prefix_cache_.end()) {
+    // Refresh LRU + repoint instance.
+    prefix_lru_list_.erase(it->second.lru_it);
+    prefix_lru_list_.push_front(key);
+    it->second.instance_name = instance_name;
+    it->second.lru_it = prefix_lru_list_.begin();
+    return;
+  }
+  prefix_lru_list_.push_front(key);
+  prefix_cache_[key] = {instance_name, prefix_lru_list_.begin()};
+  // Evict if over capacity.
+  const size_t cap = static_cast<size_t>(
+      std::max(1, FLAGS_prefix_aware_cache_capacity));
+  while (prefix_cache_.size() > cap) {
+    const PrefixKey& evict_key = prefix_lru_list_.back();
+    prefix_cache_.erase(evict_key);
+    prefix_lru_list_.pop_back();
+  }
+}
+
+void InstanceMgr::invalidate_prefix_cache_for_instance(
+    const std::string& instance_name) {
+  if (instance_name.empty()) return;
+  std::unique_lock<std::shared_mutex> lock(prefix_cache_mutex_);
+  for (auto it = prefix_cache_.begin(); it != prefix_cache_.end();) {
+    if (it->second.instance_name == instance_name) {
+      prefix_lru_list_.erase(it->second.lru_it);
+      it = prefix_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 bool InstanceMgr::register_instance(const std::string& name,
@@ -3833,6 +3984,12 @@ void InstanceMgr::deregister_instance(
 
   scheduler_->clear_requests_on_failed_instance(
       name, info.incarnation_id, get_cleanup_type(info));
+
+  // P0: drop any prefix cache entries pointing at this instance so a
+  // fresh registration with the same name doesn't inherit stale hits.
+  if (FLAGS_enable_prefix_aware_routing) {
+    invalidate_prefix_cache_for_instance(name);
+  }
 
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);

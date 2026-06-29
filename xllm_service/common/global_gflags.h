@@ -190,3 +190,8 @@ DECLARE_string(tool_call_parser);
 DECLARE_string(reasoning_parser);
 
 DECLARE_int32(readiness_check_interval_s);
+
+DECLARE_bool(enable_prefix_aware_routing);
+DECLARE_int32(prefix_aware_block_size_tokens);
+DECLARE_int32(prefix_aware_cache_capacity);
+DECLARE_double(kv_cache_overlap_credit_per_block);
