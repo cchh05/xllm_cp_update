@@ -107,6 +107,13 @@ DEFINE_bool(enable_static_prefill_instance_split,
             "Whether to route prefill requests to different prefill instance "
             "subsets based on prompt length.");
 
+DEFINE_bool(enable_mix_dual_register,
+            false,
+            "When true, a MIX instance is registered into both prefill_index_ "
+            "and decode_index_ so RR routing can pick it for either role. "
+            "When false (default), a MIX instance lives in exactly one index "
+            "and matches the legacy slo-aware behavior.");
+
 DEFINE_string(static_prefill_short_instance_selectors,
               "",
               "Comma-separated list of selectors for short-request prefill "
@@ -956,3 +963,49 @@ DEFINE_int32(readiness_check_interval_s,
              "before starting and during runtime of the HTTP service.");
 
 BRPC_VALIDATE_GFLAG(readiness_check_interval_s, brpc::PositiveInteger);
+
+// P0 — prefix-aware routing (lightweight service-side prediction).
+// Maintains an LRU cache mapping (block-hash sequence) -> last-served
+// instance. When a new request comes in, candidate instances that
+// match a stored prefix earn an extra score bonus, biasing routing
+// toward instances likely to still hold the relevant KV blocks.
+DEFINE_bool(enable_prefix_aware_routing,
+            false,
+            "P0: enable lightweight service-side prefix-aware routing. "
+            "Records (prompt block hash sequence -> instance) and biases "
+            "future requests with overlapping prefixes back to the same "
+            "instance. Default false preserves existing behavior.");
+
+DEFINE_int32(prefix_aware_block_size_tokens,
+             128,
+             "P0: token granularity per block hash. Each block of this "
+             "many tokens contributes one xxhash value to the prefix "
+             "cache key. Larger -> coarser sharing; smaller -> finer.");
+
+BRPC_VALIDATE_GFLAG(prefix_aware_block_size_tokens, brpc::PositiveInteger);
+
+DEFINE_int32(prefix_aware_cache_capacity,
+             4096,
+             "P0: max number of entries in the prefix-aware LRU cache.");
+
+BRPC_VALIDATE_GFLAG(prefix_aware_cache_capacity, brpc::PositiveInteger);
+
+DEFINE_double(kv_cache_overlap_credit_per_block,
+              50.0,
+              "P0: per-matched-block bonus added to a candidate's "
+              "hybrid scoring when the prefix-aware cache shows it "
+              "served the same prompt prefix. Same units as "
+              "hybrid_prefill_*_affinity_bonus. Used only when "
+              "prefix_bonus_max <= 0 (legacy absolute mode).");
+
+DEFINE_double(prefix_bonus_max,
+              0.0,
+              "P0 (relative-ratio mode): when > 0, the prefix bonus is "
+              "computed as prefix_bonus_max * (matched_blocks / "
+              "max(1, request_block_count)), giving a value in "
+              "[0, prefix_bonus_max] proportional to the fraction of the "
+              "prompt that overlaps the cached prefix. This decouples the "
+              "bonus from absolute token / block_size / model size, and "
+              "should typically be set < lane_gap (~100) so prefix never "
+              "dominates lane decisions. When <= 0, falls back to "
+              "kv_cache_overlap_credit_per_block * matched_blocks.");
