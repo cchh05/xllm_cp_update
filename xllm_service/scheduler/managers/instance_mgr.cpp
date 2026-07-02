@@ -1568,10 +1568,14 @@ void InstanceMgr::refresh_instance_registration(const std::string& name,
 
   // Preserve local scheduling/index state across etcd refreshes.
   const auto instance_index = it->second.instance_index;
+  const auto prefill_instance_index = it->second.prefill_instance_index;
+  const auto decode_instance_index = it->second.decode_instance_index;
   const auto current_type = it->second.current_type;
 
   it->second = info;
   it->second.instance_index = instance_index;
+  it->second.prefill_instance_index = prefill_instance_index;
+  it->second.decode_instance_index = decode_instance_index;
   it->second.current_type = current_type;
   it->second.latest_timestamp = current_time_ms();
   it->second.runtime_state = InstanceRuntimeState::ACTIVE;
@@ -1691,6 +1695,23 @@ bool InstanceMgr::select_instance_pair_on_slo(
       static_cast<size_t>(std::max<int32_t>(
           0, options_.long_request_threshold_tokens()));
   const int32_t request_tokens = static_cast<int32_t>(request->token_ids.size());
+
+  // === P0 prefix-aware routing: lookup ===
+  // Compute the request's block hash sequence and look up the longest
+  // matching prefix in the LRU cache. The matched instance (if any)
+  // earns a bonus inside evaluate_hybrid_candidate below.
+  std::vector<uint64_t> request_block_hashes;
+  size_t prefix_matched_blocks = 0;
+  std::string prefix_matched_instance;
+  if (FLAGS_enable_prefix_aware_routing) {
+    request_block_hashes = compute_request_block_hashes(request->token_ids);
+    if (!request_block_hashes.empty()) {
+      std::shared_lock<std::shared_mutex> pc_lock(prefix_cache_mutex_);
+      lookup_prefix_cache_locked(request_block_hashes,
+                                 &prefix_matched_blocks,
+                                 &prefix_matched_instance);
+    }
+  }
   const int64_t decode_work_tokens =
       estimate_decode_work_tokens(request, request_tokens, request_is_long);
   const int32_t hard_long_threshold =
@@ -2582,6 +2603,36 @@ bool InstanceMgr::select_instance_pair_on_slo(
         candidate.score_v0_3 -= candidate.decode_pressure_route_cost;
         candidate.score -= candidate.decode_pressure_route_cost;
       }
+
+      // === P0 prefix-aware routing: bonus ===
+      // If this candidate was the previous server for an overlapping
+      // prompt prefix, add a bonus.
+      // - When prefix_bonus_max > 0: bonus = prefix_bonus_max * (matched / total)
+      //   This is the recommended "relative ratio" mode: the bonus is in [0,
+      //   prefix_bonus_max] regardless of tokenizer / block_size / prompt
+      //   length, so the same parameter value generalizes across models.
+      // - When prefix_bonus_max <= 0: bonus = matched_blocks * credit_per_block
+      //   (legacy absolute mode, kept for backwards compatibility).
+      if (FLAGS_enable_prefix_aware_routing &&
+          prefix_matched_blocks > 0 &&
+          !prefix_matched_instance.empty() &&
+          prefill_instance == prefix_matched_instance) {
+        double bonus;
+        if (FLAGS_prefix_bonus_max > 0.0) {
+          const size_t total_blocks = request_block_hashes.size();
+          const double ratio = total_blocks > 0
+              ? static_cast<double>(prefix_matched_blocks) /
+                static_cast<double>(total_blocks)
+              : 0.0;
+          bonus = FLAGS_prefix_bonus_max * ratio;
+        } else {
+          bonus = static_cast<double>(prefix_matched_blocks) *
+                  FLAGS_kv_cache_overlap_credit_per_block;
+        }
+        candidate.score_v0_2 += bonus;
+        candidate.score_v0_3 += bonus;
+        candidate.score += bonus;
+      }
       if (candidate.short_long_lane_guarded &&
           FLAGS_hybrid_prefill_short_long_lane_guard_hard_reject) {
         candidate.score = std::numeric_limits<double>::lowest();
@@ -2737,6 +2788,25 @@ bool InstanceMgr::select_instance_pair_on_slo(
           {"affinity_bonus", candidate_score.affinity_bonus},
           {"affinity_bonus_v0_2", candidate_score.affinity_bonus_v0_2},
           {"affinity_bonus_v0_3", candidate_score.affinity_bonus_v0_3},
+          {"prefix_matched_blocks_for_this_instance",
+           (FLAGS_enable_prefix_aware_routing &&
+            !prefix_matched_instance.empty() &&
+            prefill_instance == prefix_matched_instance)
+               ? static_cast<int64_t>(prefix_matched_blocks)
+               : static_cast<int64_t>(0)},
+          {"prefix_bonus",
+           (FLAGS_enable_prefix_aware_routing &&
+            !prefix_matched_instance.empty() &&
+            prefill_instance == prefix_matched_instance)
+               ? (FLAGS_prefix_bonus_max > 0.0
+                      ? FLAGS_prefix_bonus_max *
+                            (request_block_hashes.empty()
+                                 ? 0.0
+                                 : static_cast<double>(prefix_matched_blocks) /
+                                   static_cast<double>(request_block_hashes.size()))
+                      : static_cast<double>(prefix_matched_blocks) *
+                            FLAGS_kv_cache_overlap_credit_per_block)
+               : 0.0},
           {"long_affinity_base_bonus",
            candidate_score.long_affinity_base_bonus},
           {"dynamic_long_affinity_bonus",
@@ -3434,6 +3504,18 @@ bool InstanceMgr::select_instance_pair_on_slo(
         {"selected_score_v0_3", selected_prefill_score_v0_3},
         {"selected_affinity_bonus", selected_affinity_bonus},
         {"selected_rescue_bonus", selected_rescue_bonus},
+        {"prefix_aware_routing_enabled",
+         FLAGS_enable_prefix_aware_routing},
+        {"prefix_matched_blocks",
+         static_cast<int64_t>(prefix_matched_blocks)},
+        {"prefix_matched_instance", prefix_matched_instance},
+        {"prefix_request_block_count",
+         static_cast<int64_t>(request_block_hashes.size())},
+        {"prefix_bonus_applied_to_selected",
+         (FLAGS_enable_prefix_aware_routing &&
+          prefix_matched_blocks > 0 &&
+          !prefix_matched_instance.empty() &&
+          selected_prefill_instance == prefix_matched_instance)},
         {"selected_boundary_long_escape_bonus",
          selected_boundary_long_escape_bonus},
         {"selected_long_affine_busy_penalty",
@@ -3565,6 +3647,17 @@ bool InstanceMgr::select_instance_pair_on_slo(
     flip_prefill_to_decode(request->routing.prefill_name);
   }
 
+  // === P0 prefix-aware routing: insert ===
+  // After we've picked the prefill, record (block_hashes -> selected
+  // instance) so subsequent overlapping prefixes get steered back here.
+  if (FLAGS_enable_prefix_aware_routing &&
+      !request_block_hashes.empty() &&
+      !request->routing.prefill_name.empty()) {
+    std::unique_lock<std::shared_mutex> pc_lock(prefix_cache_mutex_);
+    insert_prefix_cache_locked(request_block_hashes,
+                               request->routing.prefill_name);
+  }
+
   return true;
 }
 
@@ -3694,6 +3787,112 @@ bool InstanceMgr::call_unlink_instance(const std::string& target_rpc_addr,
     return false;
   }
   return res.ok();
+}
+
+// === P0 prefix-aware routing helpers (lightweight service-side prediction) ===
+
+namespace {
+// Simple, dependency-free 64-bit FNV-1a hash. Avoids pulling xxhash. The
+// prefix cache only needs collision-resistance proportional to its
+// capacity (~thousands of keys), so FNV-1a is enough.
+inline uint64_t fnv1a_hash_block(const int32_t* tokens, size_t n) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t t = static_cast<uint32_t>(tokens[i]);
+    for (int b = 0; b < 4; ++b) {
+      h ^= static_cast<uint64_t>(t & 0xff);
+      h *= 0x100000001b3ULL;
+      t >>= 8;
+    }
+  }
+  return h;
+}
+}  // namespace
+
+std::vector<uint64_t> InstanceMgr::compute_request_block_hashes(
+    const std::vector<int32_t>& token_ids) const {
+  const int32_t block_size = std::max(
+      1, FLAGS_prefix_aware_block_size_tokens);
+  const size_t num_full_blocks = token_ids.size() / static_cast<size_t>(block_size);
+  std::vector<uint64_t> hashes;
+  hashes.reserve(num_full_blocks);
+  // Each block hash absorbs ALL preceding tokens via running state, so two
+  // requests with the same first N blocks produce the same first N hashes.
+  uint64_t running = 0xcbf29ce484222325ULL;
+  for (size_t b = 0; b < num_full_blocks; ++b) {
+    const int32_t* start = token_ids.data() + b * block_size;
+    // Mix this block's tokens into running state.
+    for (int32_t i = 0; i < block_size; ++i) {
+      uint32_t t = static_cast<uint32_t>(start[i]);
+      for (int k = 0; k < 4; ++k) {
+        running ^= static_cast<uint64_t>(t & 0xff);
+        running *= 0x100000001b3ULL;
+        t >>= 8;
+      }
+    }
+    hashes.push_back(running);
+  }
+  return hashes;
+}
+
+void InstanceMgr::lookup_prefix_cache_locked(
+    const std::vector<uint64_t>& block_hashes,
+    size_t* matched_blocks,
+    std::string* instance_name) const {
+  *matched_blocks = 0;
+  instance_name->clear();
+  if (block_hashes.empty()) return;
+  // Greedy longest-prefix lookup: try the full sequence first, then shrink
+  // from the tail until a hit or empty.
+  for (size_t len = block_hashes.size(); len > 0; --len) {
+    PrefixKey key(block_hashes.begin(), block_hashes.begin() + len);
+    auto it = prefix_cache_.find(key);
+    if (it != prefix_cache_.end()) {
+      *matched_blocks = len;
+      *instance_name = it->second.instance_name;
+      return;
+    }
+  }
+}
+
+void InstanceMgr::insert_prefix_cache_locked(
+    const std::vector<uint64_t>& block_hashes,
+    const std::string& instance_name) {
+  if (block_hashes.empty() || instance_name.empty()) return;
+  PrefixKey key = block_hashes;
+  auto it = prefix_cache_.find(key);
+  if (it != prefix_cache_.end()) {
+    // Refresh LRU + repoint instance.
+    prefix_lru_list_.erase(it->second.lru_it);
+    prefix_lru_list_.push_front(key);
+    it->second.instance_name = instance_name;
+    it->second.lru_it = prefix_lru_list_.begin();
+    return;
+  }
+  prefix_lru_list_.push_front(key);
+  prefix_cache_[key] = {instance_name, prefix_lru_list_.begin()};
+  // Evict if over capacity.
+  const size_t cap = static_cast<size_t>(
+      std::max(1, FLAGS_prefix_aware_cache_capacity));
+  while (prefix_cache_.size() > cap) {
+    const PrefixKey& evict_key = prefix_lru_list_.back();
+    prefix_cache_.erase(evict_key);
+    prefix_lru_list_.pop_back();
+  }
+}
+
+void InstanceMgr::invalidate_prefix_cache_for_instance(
+    const std::string& instance_name) {
+  if (instance_name.empty()) return;
+  std::unique_lock<std::shared_mutex> lock(prefix_cache_mutex_);
+  for (auto it = prefix_cache_.begin(); it != prefix_cache_.end();) {
+    if (it->second.instance_name == instance_name) {
+      prefix_lru_list_.erase(it->second.lru_it);
+      it = prefix_cache_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 bool InstanceMgr::register_instance(const std::string& name,
@@ -3830,6 +4029,12 @@ void InstanceMgr::deregister_instance(
   scheduler_->clear_requests_on_failed_instance(
       name, info.incarnation_id, get_cleanup_type(info));
 
+  // P0: drop any prefix cache entries pointing at this instance so a
+  // fresh registration with the same name doesn't inherit stale hits.
+  if (FLAGS_enable_prefix_aware_routing) {
+    invalidate_prefix_cache_for_instance(name);
+  }
+
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
     auto it = instances_.find(name);
@@ -3884,11 +4089,41 @@ bool InstanceMgr::gather_link_operations(
       break;
     }
     case InstanceType::MIX: {
+      // For each peer, emit a link op in the engine D->P direction
+      // (xllm/core/distributed_runtime/llm_engine.cpp:link_cluster only
+      // supports D-side initiating link to P-side endpoints):
+      //   - peer is PREFILL  -> MIX acts as D, MIX calls LinkInstance(peer=P)
+      //   - peer is DECODE   -> MIX acts as P, peer (D) calls LinkInstance(peer=MIX)
+      //   - peer is DEFAULT  -> treat as P (single-instance topology)
+      //   - peer is MIX      -> bidirectional dual-register requires both
+      //                         sides; emit two ops, one per direction.
+      // Without this split, a freshly-registered MIX would push a single
+      // (MIX.rpc, peer) op for every peer, including DECODE peers, and the
+      // DECODE-link op would fail because the engine refuses MIX(D)->DECODE(P)
+      // links (the role assignment is wrong).
       for (const auto& [peer_name, peer_info] : instances_) {
         if (peer_name == info.name) {
           continue;
         }
-        out_ops->emplace_back(info.rpc_address, peer_info);
+        switch (peer_info.type) {
+          case InstanceType::PREFILL:
+          case InstanceType::DEFAULT:
+            // MIX is the D-side caller, peer (P) is the link target.
+            out_ops->emplace_back(info.rpc_address, peer_info);
+            break;
+          case InstanceType::DECODE:
+            // peer (D) is the caller, MIX (P) is the link target.
+            out_ops->emplace_back(peer_info.rpc_address, info);
+            break;
+          case InstanceType::MIX:
+            // Two MIX in the same topology: emit both directions so each
+            // can serve either role for the other.
+            out_ops->emplace_back(info.rpc_address, peer_info);
+            out_ops->emplace_back(peer_info.rpc_address, info);
+            break;
+          default:
+            break;
+        }
       }
       break;
     }
@@ -3955,7 +4190,17 @@ void InstanceMgr::add_instance_to_index(const std::string& name,
       LOG(INFO) << "Register a new decode instance, instance name : " << name;
       break;
     case InstanceType::MIX:
-      if (decode_index_.size() > 0) {
+      if (FLAGS_enable_mix_dual_register) {
+        info.prefill_instance_index = prefill_index_.size();
+        prefill_index_.emplace_back(name);
+        info.decode_instance_index = decode_index_.size();
+        decode_index_.emplace_back(name);
+        info.instance_index = info.prefill_instance_index;
+        info.current_type = InstanceType::PREFILL;
+        LOG(INFO) << "Register a new dual-mode mix instance: " << name
+                  << " prefill_idx=" << info.prefill_instance_index
+                  << " decode_idx=" << info.decode_instance_index;
+      } else if (decode_index_.size() > 0) {
         info.instance_index = prefill_index_.size();
         info.current_type = InstanceType::PREFILL;
         prefill_index_.emplace_back(name);
@@ -3975,29 +4220,63 @@ void InstanceMgr::add_instance_to_index(const std::string& name,
 
 void InstanceMgr::remove_instance_from_index(const std::string& name,
                                              const InstanceMetaInfo& info) {
-  uint64_t index = info.instance_index;
-  if (index == -1) return;
-
-  auto remove_from_vec = [&](std::vector<std::string>& vec) {
-    if (index >= vec.size()) return;
-    std::swap(vec[index], vec.back());
-    instances_[vec[index]].instance_index = index;
+  auto remove_at = [&](std::vector<std::string>& vec, uint64_t idx,
+                       bool is_prefill) {
+    if (idx == static_cast<uint64_t>(-1) || idx >= vec.size()) return;
+    std::swap(vec[idx], vec.back());
+    if (is_prefill) {
+      auto& moved = instances_[vec[idx]];
+      if (moved.type == InstanceType::MIX &&
+          moved.prefill_instance_index != static_cast<uint64_t>(-1)) {
+        moved.prefill_instance_index = idx;
+        if (moved.current_type == InstanceType::PREFILL) {
+          moved.instance_index = idx;
+        }
+      } else {
+        moved.instance_index = idx;
+      }
+    } else {
+      auto& moved = instances_[vec[idx]];
+      if (moved.type == InstanceType::MIX &&
+          moved.decode_instance_index != static_cast<uint64_t>(-1)) {
+        moved.decode_instance_index = idx;
+        if (moved.current_type == InstanceType::DECODE) {
+          moved.instance_index = idx;
+        }
+      } else {
+        moved.instance_index = idx;
+      }
+    }
     vec.pop_back();
   };
+
+  if (info.type == InstanceType::MIX &&
+      info.prefill_instance_index != static_cast<uint64_t>(-1) &&
+      info.decode_instance_index != static_cast<uint64_t>(-1)) {
+    // Dual-registered MIX: pop from both vectors. Order matters when the
+    // tail of one vector is the same instance about to be popped from the
+    // other; the swap-with-back lambda already handles that.
+    remove_at(prefill_index_, info.prefill_instance_index, /*is_prefill=*/true);
+    remove_at(decode_index_, info.decode_instance_index, /*is_prefill=*/false);
+    return;
+  }
+
+  uint64_t index = info.instance_index;
+  if (index == static_cast<uint64_t>(-1)) return;
 
   switch (info.type) {
     case InstanceType::DEFAULT:
     case InstanceType::PREFILL:
-      remove_from_vec(prefill_index_);
+      remove_at(prefill_index_, index, /*is_prefill=*/true);
       break;
     case InstanceType::DECODE:
-      remove_from_vec(decode_index_);
+      remove_at(decode_index_, index, /*is_prefill=*/false);
       break;
     case InstanceType::MIX:
       if (info.current_type == InstanceType::PREFILL) {
-        remove_from_vec(prefill_index_);
+        remove_at(prefill_index_, index, /*is_prefill=*/true);
       } else {
-        remove_from_vec(decode_index_);
+        remove_at(decode_index_, index, /*is_prefill=*/false);
       }
       break;
     default:
@@ -4028,7 +4307,13 @@ bool InstanceMgr::has_available_instances() const {
         has_decode = true;
         break;
       case InstanceType::MIX:
-        if (info.current_type == InstanceType::PREFILL) {
+        if (info.prefill_instance_index != static_cast<uint64_t>(-1) &&
+            info.decode_instance_index != static_cast<uint64_t>(-1)) {
+          // Dual-registered MIX is simultaneously available as prefill and
+          // decode for routing purposes.
+          has_mix_as_prefill = true;
+          has_mix_as_decode = true;
+        } else if (info.current_type == InstanceType::PREFILL) {
           has_mix_as_prefill = true;
         } else if (info.current_type == InstanceType::DECODE) {
           has_mix_as_decode = true;

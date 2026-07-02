@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <list>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -160,6 +161,31 @@ class InstanceMgr final {
   bool call_unlink_instance(const std::string& target_rpc_addr,
                             const InstanceMetaInfo& peer_info);
 
+  // P0 prefix-aware routing (lightweight, service-side prediction).
+  // Compute block-hash sequence from a request's token ids using the
+  // configured block size (in tokens). Each block contributes one
+  // 64-bit hash; partial trailing blocks are skipped.
+  std::vector<uint64_t> compute_request_block_hashes(
+      const std::vector<int32_t>& token_ids) const;
+
+  // Look up the LRU prefix cache for a request. Returns the longest
+  // matching block prefix and the instance that previously served it
+  // (or empty string if none). Caller holds prefix_cache_mutex_.
+  // Outputs: matched_blocks (number of blocks shared), instance_name.
+  void lookup_prefix_cache_locked(
+      const std::vector<uint64_t>& block_hashes,
+      size_t* matched_blocks,
+      std::string* instance_name) const;
+
+  // Insert/refresh a (block_hashes, instance) entry. Evicts LRU when
+  // capacity is exceeded.
+  void insert_prefix_cache_locked(const std::vector<uint64_t>& block_hashes,
+                                  const std::string& instance_name);
+
+  // Drop all prefix cache entries that point at instance_name (called
+  // when an instance deregisters / becomes unschedulable).
+  void invalidate_prefix_cache_for_instance(const std::string& instance_name);
+
   // Locking (scheme B): only two mutexes participate in ordering.
   // L1 cluster_mutex_: instances_, indices, cached_channels_.
   // L2 metrics_mutex_: load_metrics_, request_metrics_, latency_metrics_,
@@ -201,6 +227,28 @@ class InstanceMgr final {
   std::unordered_map<std::string, TimePredictor> time_predictors_;
   std::unordered_map<std::string, LatencyMetrics> latency_metrics_;
   std::unordered_map<std::string, RequestMetrics> request_metrics_;
+
+  // L3 — prefix-aware routing cache (P0).
+  // Independent mutex to avoid contention with route hot path; only
+  // used when --enable_prefix_aware_routing=true.
+  // Map keyed by block-hash sequence (vector<uint64>) -> (instance_name,
+  // LRU iterator). LRU list stores the keys; front = most recent.
+  // Capacity bounded by --prefix_aware_cache_capacity.
+  mutable std::shared_mutex prefix_cache_mutex_;
+  using PrefixKey = std::vector<uint64_t>;
+  struct PrefixKeyHash {
+    size_t operator()(const PrefixKey& k) const noexcept {
+      size_t h = 0;
+      for (uint64_t v : k) h ^= std::hash<uint64_t>{}(v) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  struct PrefixCacheEntry {
+    std::string instance_name;
+    std::list<PrefixKey>::iterator lru_it;
+  };
+  std::unordered_map<PrefixKey, PrefixCacheEntry, PrefixKeyHash> prefix_cache_;
+  std::list<PrefixKey> prefix_lru_list_;
 
   // not own
   // NOTE: need to refactor with scheduler in future
