@@ -7,9 +7,11 @@ cc_library(
   HDRS
     instance_mgr.h
     global_kvcache_mgr.h
+    pool_elastic_stats.h
   SRCS
     instance_mgr.cpp
     global_kvcache_mgr.cpp
+    pool_elastic_stats.cpp
   DEPS
     :chat_template
     :common
